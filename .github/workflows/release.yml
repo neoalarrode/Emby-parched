@@ -1,10 +1,16 @@
 name: release
 
-# Al crear una etiqueta v* compila el parcheador (linux-x64 y linux-arm64) y publica
-# emby-parched-linux.tar.gz como release, listo para ejecutar aplicar-parche.sh.
+# Compila el parcheador (linux-x64 y linux-arm64) y publica emby-parched-linux.tar.gz como
+# release, listo para ejecutar aplicar-parche.sh. Se lanza al subir una etiqueta v* o a mano
+# (Actions -> release -> Run workflow), indicando la versión; en ese caso la etiqueta la crea la release.
 on:
   push:
     tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Versión de la release (etiqueta), p. ej. v1.0.0'
+        required: true
 
 permissions:
   contents: write
@@ -32,7 +38,9 @@ jobs:
       - name: Publicar release
         env:
           GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ inputs.version || github.ref_name }}
         run: |
-          gh release create "$GITHUB_REF_NAME" emby-parched-linux.tar.gz \
-            --title "$GITHUB_REF_NAME" \
+          gh release create "$VERSION" emby-parched-linux.tar.gz \
+            --target "$GITHUB_SHA" \
+            --title "$VERSION" \
             --notes "Kit listo para usar: descomprimir y ejecutar \`sudo ./aplicar-parche.sh\`. Ver README."
