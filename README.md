@@ -119,6 +119,9 @@ Este repositorio no incluye binarios de Emby: el parche se aplica sobre tu propi
 - `src/`: parcheador (`EmbyNoShare`, Mono.Cecil).
 - `aplicar-parche.sh`: aplica el parche sobre una instalación existente.
 - `build.sh`: compila el parcheador como binario autónomo para linux-x64 y linux-arm64.
+- `tools/emby-sesiones.sh`: diagnóstico a partir de los logs de Emby. Sin argumentos lista las sesiones
+  de reproducción (dispositivo, app, canal, PlaySessionId); con un PlaySessionId muestra IP, motivos de
+  conversión, tiempos de entrega de segmentos y el ffmpeg asociado.
 
 ## Verificar que funciona
 
