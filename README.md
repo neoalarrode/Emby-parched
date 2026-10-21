@@ -2,14 +2,15 @@
 
 Emby Server – Live TV sin compartición de streams
 
-Parches para `Emby.LiveTV.dll` (probados con Emby Server 4.10.2.0):
+Parches para Emby Server (probados con 4.10.2.0 y 4.11.0.9):
 
 1. **Sin compartición de streams**: cada cliente que reproduce un canal tiene su propia conexión con el
    proveedor, su propio buffer y su propio LiveStreamId.
-2. **TARGETDURATION correcto** en el HLS de Live TV, que evita entrecortes en Fire TV / Android TV
-   cuando el canal tiene keyframes espaciados.
+2. **TARGETDURATION correcto** en el HLS de Live TV cuando el canal tiene keyframes espaciados
+   (solo 4.10; Emby 4.11 ya lo corrige y el parcheador lo omite).
+3. **Margen HLS para Fire TV con Vega OS**, que evita los cortes cuando la fuente llega a golpes.
 
-El parcheador aplica solo los parches que falten, así que se puede ejecutar sobre una DLL ya parcheada.
+El parcheador aplica solo los parches que falten (y omite los que la versión de Emby ya no necesita), así que se puede ejecutar sobre una instalación ya parcheada.
 
 ## Parche 1: sin compartición de streams (2 métodos, a nivel IL)
 
@@ -23,7 +24,7 @@ El parcheador aplica solo los parches que falten, así que se puede ejecutar sob
    Sin esto, el segundo stream del mismo canal sobrescribiría al primero en
    `MediaSourceManager._openStreams`, y al cerrar uno se cerraría el del otro cliente.
 
-## Parche 2: TARGETDURATION correcto en el HLS de Live TV (Fire TV / Android TV)
+## Parche 2: TARGETDURATION correcto en el HLS de Live TV (solo Emby 4.10)
 
 Cuando un cliente reproduce Live TV en *direct stream*, Emby convierte el MPEG-TS en HLS con su
 propio segmentador (`/LiveTv/LiveStreamFiles/<id>/hls/live.m3u8`). El segmentador corta solo en
@@ -50,6 +51,33 @@ Recomendación aparte: en *Live TV → Avanzado*, "Límite de tamaño del búfer
 viene en **Ilimitado**. La playlist en directo incluye todos los segmentos del buffer, así que crece
 sin parar (unos 1200 segmentos por hora) y el cliente la descarga entera cada pocos segundos.
 Ponerlo en 1 hora limita ese crecimiento (y el disco usado).
+
+## Parche 3: margen HLS para Fire TV con Vega OS (`Emby.Server.MediaEncoding.dll`)
+
+La app de Emby para Fire TV con Vega OS no admite MPEG-TS, así que Emby le convierte el canal a HLS
+con ffmpeg y le sirve un `live.m3u8` (`BaseHlsService.GetLivePlaylistText`). El reproductor se coloca a
+3 × TARGETDURATION = 12 s del directo. Si la fuente llega a golpes con huecos más largos (se han visto
+huecos de 12–18 s cada 40–90 s), se queda sin buffer y se corta. Los clientes que reciben el `.ts`
+directo (Apple TV) no lo notan.
+
+Para los clientes cuyo User-Agent contiene `Kepler` (Vega OS), el parche añade a esa playlist:
+
+    #EXT-X-START:TIME-OFFSET=-30
+    #EXT-X-SERVER-CONTROL:HOLD-BACK=30
+
+que indican al reproductor que se coloque a 30 s del directo. El resto de clientes no cambia.
+
+Se ajusta en `/etc/emby-server.conf` (se conserva al actualizar Emby) y se aplica tras
+`sudo systemctl restart emby-server`:
+
+    EMBY_HLS_HOLDBACK=30          # segundos de margen; 0 lo desactiva (por defecto 30)
+    EMBY_HLS_HOLDBACK_UA=Kepler   # texto del User-Agent que lo activa; vacío = todos los clientes
+
+Para que haya ese margen desde el primer segundo, Dispatcharr debe entregar al menos esos segundos al
+abrir el canal: "New Client Buffer (seconds)" ≥ EMBY_HLS_HOLDBACK. Si es menor, el reproductor empieza
+con el margen que haya.
+
+Efecto secundario: el Fire irá ~30 s por detrás del directo.
 
 ## Instalación
 
