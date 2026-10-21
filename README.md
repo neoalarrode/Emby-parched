@@ -9,6 +9,8 @@ Parches para Emby Server (probados con 4.10.2.0 y 4.11.0.9):
 2. **TARGETDURATION correcto** en el HLS de Live TV cuando el canal tiene keyframes espaciados
    (solo 4.10; Emby 4.11 ya lo corrige y el parcheador lo omite).
 3. **Margen HLS para Fire TV con Vega OS**, que evita los cortes cuando la fuente llega a golpes.
+4. **Caché de la guía XMLTV**: los plugins "Xml TV" y M3U dejan de acumular una copia de la guía por cada
+   actualización.
 
 El parcheador aplica solo los parches que falten (y omite los que la versión de Emby ya no necesita), así que se puede ejecutar sobre una instalación ya parcheada.
 
@@ -79,6 +81,23 @@ con el margen que haya.
 
 Efecto secundario: el Fire irá ~30 s por detrás del directo.
 
+## Parche 4: caché de la guía XMLTV (plugins "Xml TV" y M3U)
+
+Los plugins "Xml TV" (`Emby.XmlTV.dll`) y M3U (`Emby.M3UTuner.dll`) guardan cada copia descomprimida
+de la guía como `md5(URL)_<clave>.xml` en `/var/lib/emby/cache/xmltv` o `/var/lib/emby/cache/m3u-xmltv`.
+La clave es aleatoria y cambia en cada actualización de la guía (`ClearProgramCaches`, al empezar y al
+terminar) y en cada reinicio de Emby, pero las copias anteriores nunca se borran: solo las elimina la tarea
+"Eliminar archivos de caché" cuando tienen más de 30 días. Con guías grandes se acumulan muchos GB.
+
+El parche hace que `XmlTvProvider.ClearProgramCaches()`, tras cambiar la clave, borre la carpeta de
+caché de ese plugin (todas sus copias han quedado obsoletas; la siguiente descarga la vuelve a crear).
+Lo hace con el semáforo de descargas tomado, para no pisar una descarga en curso, e ignora cualquier
+error. Si el nombre de la carpeta estuviera vacío no borra nada.
+
+El script parchea los plugins solo si están instalados en `/var/lib/emby/plugins` (o en la carpeta que
+se le pase como segundo argumento). Al actualizar un plugin desde Emby se pierde el parche: basta con
+volver a ejecutar el script.
+
 ## Instalación
 
 Desde la última release (ya compilado, no requiere .NET):
@@ -101,7 +120,7 @@ Copia la carpeta al servidor y ejecuta (x64 o arm64; el servidor no necesita .NE
 El script comprueba primero que el patrón IL coincide (si Emby cambia ese código, falla sin tocar nada),
 guarda un backup de la DLL, aplica el parche y reinicia `emby-server`. Si la DLL ya está parcheada no hace nada.
 
-Para revertir: el script muestra la ruta exacta de la copia de seguridad que crea en cada ejecución. La copia más antigua (`ls -tr /opt/emby-server/system/Emby.LiveTV.dll.orig-* | head -1`) es la DLL original de Emby.
+Para revertir: el script muestra la ruta exacta de cada copia de seguridad que crea (`<dll>.orig-<fecha>`, junto a cada DLL). Copia la que quieras sobre su DLL y reinicia `emby-server`. La copia más antigua de cada DLL es la original.
 
 Cada actualización de Emby sobrescribe la DLL, así que habrá que volver a ejecutar `aplicar-parche.sh`.
 

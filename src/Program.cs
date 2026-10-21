@@ -31,7 +31,17 @@
 //     segundos de EMBY_HLS_HOLDBACK (por defecto 30; 0 lo desactiva). Ambas variables se leen
 //     del entorno en cada petición (en Debian/Ubuntu, /etc/emby-server.conf).
 //
-// Uso: EmbyNoShare <ruta/Emby.LiveTV.dll | ruta/Emby.Server.MediaEncoding.dll> [--check]
+// Plugins "Xml TV" (Emby.XmlTV.dll) y M3U (Emby.M3UTuner.dll), en /var/lib/emby/plugins
+//   xmltv-cache-cleanup (marcador EmbyNoShare.XmlTvCacheCleanup):
+//     Emby.XmlTV.XmlTvProvider guarda cada copia de la guía como md5(URL)_<clave>.xml en
+//     cache/<CachePathFolderName> ("xmltv" o "m3u-xmltv"), y ClearProgramCaches() genera una
+//     clave nueva en cada actualización de la guía (y cada reinicio crea otra), pero nunca borra
+//     las copias anteriores: solo las elimina la tarea de limpieza de caché a los 30 días. El
+//     parche hace que ClearProgramCaches() borre esa carpeta tras cambiar la clave (todas sus
+//     copias han quedado obsoletas), con el semáforo de descargas tomado para no pisar una
+//     descarga en curso e ignorando cualquier error. Si el nombre de carpeta está vacío no borra nada.
+//
+// Uso: EmbyNoShare <ruta/Emby.LiveTV.dll | ruta/Emby.Server.MediaEncoding.dll | ruta/plugin.dll> [--check]
 //   --check: 0 = hay parches pendientes y todos los patrones coinciden, 3 = nada que hacer
 using Mono.Cecil;
 using Mono.Cecil.Cil;
@@ -39,7 +49,7 @@ using Mono.Cecil.Rocks;
 
 if (args.Length < 1)
 {
-    Console.Error.WriteLine("Uso: EmbyNoShare <Emby.LiveTV.dll | Emby.Server.MediaEncoding.dll> [--check]");
+    Console.Error.WriteLine("Uso: EmbyNoShare <Emby.LiveTV.dll | Emby.Server.MediaEncoding.dll | Emby.XmlTV.dll | Emby.M3UTuner.dll> [--check]");
     return 2;
 }
 
@@ -56,6 +66,8 @@ var patches = new (string Assembly, string Marker, string Name, Func<ModuleDefin
     ("Emby.LiveTV", "Patched", "noshare", PrepareNoShare),
     ("Emby.LiveTV", "HlsTargetDuration", "hls-targetduration", PrepareHlsTargetDuration),
     ("Emby.Server.MediaEncoding", "HlsHoldBack", "hls-holdback", PrepareHlsHoldBack),
+    ("Emby.XmlTV", "XmlTvCacheCleanup", "xmltv-cache-cleanup", PrepareXmlTvCacheCleanup),
+    ("Emby.M3UTuner", "XmlTvCacheCleanup", "xmltv-cache-cleanup", PrepareXmlTvCacheCleanup),
 };
 
 var applicable = patches.Where(x => x.Assembly == asm.Name.Name).ToList();
@@ -372,5 +384,114 @@ static Action? PrepareHlsHoldBack(ModuleDefinition module)
         }
         method.Body.OptimizeMacros();
         helper.Body.OptimizeMacros();
+    };
+}
+
+static Action? PrepareXmlTvCacheCleanup(ModuleDefinition module)
+{
+    var provider = module.GetType("Emby.XmlTV.XmlTvProvider") ?? throw new Exception("No se encuentra Emby.XmlTV.XmlTvProvider");
+    var method = provider.Methods.SingleOrDefault(m => m.Name == "ClearProgramCaches" && m.Parameters.Count == 0) ?? throw new Exception("No se encuentra ClearProgramCaches");
+    var semaphore = provider.Fields.SingleOrDefault(f => f.Name == "_downloadSemaphore" && f.FieldType.FullName == "System.Threading.SemaphoreSlim") ?? throw new Exception("No se encuentra _downloadSemaphore");
+    var fileSystem = provider.Fields.SingleOrDefault(f => f.Name == "_fileSystem" && f.FieldType.FullName == "MediaBrowser.Model.IO.IFileSystem") ?? throw new Exception("No se encuentra _fileSystem");
+    var config = provider.Fields.SingleOrDefault(f => f.Name == "_config") ?? throw new Exception("No se encuentra _config");
+    var getFolder = provider.Properties.SingleOrDefault(pr => pr.Name == "CachePathFolderName")?.GetMethod ?? throw new Exception("No se encuentra CachePathFolderName");
+    var ret = method.Body.Instructions.Last();
+    if (ret.OpCode != OpCodes.Ret) throw new Exception("ClearProgramCaches no termina en ret");
+    if (!method.Body.Instructions.Any(i => i.Operand is FieldReference fr && fr.Name == "_cacheKey"))
+        throw new Exception("ClearProgramCaches ya no cambia _cacheKey");
+
+    // Referencias que el plugin ya usa (en GetXml), para heredar el ámbito correcto (netstandard, MediaBrowser.*)
+    var refs = module.GetTypes().SelectMany(t => t.Methods).Where(m => m.HasBody)
+        .SelectMany(m => m.Body.Instructions).Select(i => i.Operand).OfType<MethodReference>().ToList();
+    MethodReference Find(string type, string name, int args) =>
+        refs.FirstOrDefault(r => r.DeclaringType.FullName == type && r.Name == name && r.Parameters.Count == args)
+        ?? throw new Exception($"No se encuentra la referencia {type}::{name}");
+    var release = Find("System.Threading.SemaphoreSlim", "Release", 0);
+    var getAppPaths = Find("MediaBrowser.Controller.Configuration.IServerConfigurationManager", "get_ApplicationPaths", 0);
+    var getCachePath = Find("MediaBrowser.Common.Configuration.IApplicationPaths", "get_CachePath", 0);
+    var combine2 = Find("System.IO.Path", "Combine", 2);
+    Console.WriteLine($"[xmltv-cache-cleanup] {method.FullName}");
+
+    return () =>
+    {
+        var std = release.DeclaringType.Scope;
+        var str = module.TypeSystem.String;
+        var wait = new MethodReference("Wait", module.TypeSystem.Void, release.DeclaringType) { HasThis = true };
+        var isNullOrEmpty = new MethodReference("IsNullOrEmpty", module.TypeSystem.Boolean, new TypeReference("System", "String", module, std)) { HasThis = false };
+        isNullOrEmpty.Parameters.Add(new ParameterDefinition(str));
+        var deleteDirectory = new MethodReference("DeleteDirectory", module.TypeSystem.Void, fileSystem.FieldType) { HasThis = true };
+        deleteDirectory.Parameters.Add(new ParameterDefinition(str));
+        deleteDirectory.Parameters.Add(new ParameterDefinition(module.TypeSystem.Boolean));
+        var exceptionType = new TypeReference("System", "Exception", module, std);
+
+        // Tras cambiar _cacheKey y cerrar los ficheros abiertos:
+        //   string folder = CachePathFolderName;
+        //   if (string.IsNullOrEmpty(folder)) return;
+        //   _downloadSemaphore.Wait();
+        //   try { _fileSystem.DeleteDirectory(Path.Combine(_config.ApplicationPaths.CachePath, folder), true); }
+        //   catch (Exception) { }
+        //   _downloadSemaphore.Release();
+        method.Body.SimplifyMacros();
+        var folder = new VariableDefinition(str);
+        method.Body.Variables.Add(folder);
+        var p = method.Body.GetILProcessor();
+        var end = p.Create(OpCodes.Ret);
+        var afterTry = p.Create(OpCodes.Ldarg_0);
+
+        // El ret original pasa a ser la primera instrucción del bloque, así cualquier salto a él lo ejecuta
+        ret.OpCode = OpCodes.Ldarg_0;
+        ret.Operand = null;
+        var code = new List<Instruction>
+        {
+            p.Create(OpCodes.Call, getFolder),
+            p.Create(OpCodes.Stloc, folder),
+            p.Create(OpCodes.Ldloc, folder),
+            p.Create(OpCodes.Call, isNullOrEmpty),
+            p.Create(OpCodes.Brtrue, end),
+            p.Create(OpCodes.Ldarg_0),
+            p.Create(OpCodes.Ldfld, semaphore),
+            p.Create(OpCodes.Callvirt, wait),
+        };
+        var tryStart = p.Create(OpCodes.Ldarg_0);
+        code.AddRange(new[]
+        {
+            tryStart,
+            p.Create(OpCodes.Ldfld, fileSystem),
+            p.Create(OpCodes.Ldarg_0),
+            p.Create(OpCodes.Ldfld, config),
+            p.Create(OpCodes.Callvirt, getAppPaths),
+            p.Create(OpCodes.Callvirt, getCachePath),
+            p.Create(OpCodes.Ldloc, folder),
+            p.Create(OpCodes.Call, combine2),
+            p.Create(OpCodes.Ldc_I4_1),
+            p.Create(OpCodes.Callvirt, deleteDirectory),
+            p.Create(OpCodes.Leave, afterTry),
+        });
+        var catchStart = p.Create(OpCodes.Pop);
+        code.AddRange(new[]
+        {
+            catchStart,
+            p.Create(OpCodes.Leave, afterTry),
+            afterTry,
+            p.Create(OpCodes.Ldfld, semaphore),
+            p.Create(OpCodes.Callvirt, release),
+            p.Create(OpCodes.Pop),
+            end,
+        });
+        var anchor = ret;
+        foreach (var ins in code)
+        {
+            p.InsertAfter(anchor, ins);
+            anchor = ins;
+        }
+        method.Body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch)
+        {
+            TryStart = tryStart,
+            TryEnd = catchStart,
+            HandlerStart = catchStart,
+            HandlerEnd = afterTry,
+            CatchType = exceptionType,
+        });
+        method.Body.OptimizeMacros();
     };
 }
