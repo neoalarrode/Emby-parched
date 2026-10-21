@@ -11,6 +11,7 @@ Parches para Emby Server (probados con 4.10.2.0 y 4.11.0.9):
 3. **Margen HLS para Fire TV con Vega OS**, que evita los cortes cuando la fuente llega a golpes.
 4. **Caché de la guía XMLTV**: los plugins "Xml TV" y M3U dejan de acumular una copia de la guía por cada
    actualización.
+5. **Pista de audio según el idioma del perfil** en canales con varias pistas (`esp`, `ads`, `qaa`…).
 
 El parcheador aplica solo los parches que falten (y omite los que la versión de Emby ya no necesita), así que se puede ejecutar sobre una instalación ya parcheada.
 
@@ -97,6 +98,32 @@ error. Si el nombre de la carpeta estuviera vacío no borra nada.
 El script parchea los plugins solo si están instalados en `/var/lib/emby/plugins` (o en la carpeta que
 se le pase como segundo argumento). Al actualizar un plugin desde Emby se pierde el parche: basta con
 volver a ejecutar el script.
+
+## Parche 5: pista de audio según el idioma del perfil
+
+Con canales de varias pistas (`esp`, `spa`, `ads`, `qaa`…) Emby podía elegir una que no es el idioma
+preferido del usuario. Había cuatro causas, y se corrigen todas:
+
+1. **Códigos de idioma no reconocidos** (`Emby.Server.Implementations.dll`, `LocalizationManager`):
+   la tabla ISO 639 de Emby solo reconoce `spa`, `es` y `Spanish` como español; `esp` o `cas` contaban
+   como "sin idioma". Ahora, si un código no está en la tabla, se busca en `EMBY_LANG_ALIASES`
+   (por defecto `esp=spa,cas=spa,castellano=spa,espanol=spa,español=spa,castilian=spa`).
+2. **Pista "predeterminada" del origen por delante del idioma** (`MediaSourceManager.SetDefaultAudioStreamIndex`):
+   con la opción de perfil "reproducir la pista de audio predeterminada", la marca del canal ganaba al
+   idioma. En TV en directo (streams infinitos) ahora manda el idioma; en vídeos normales no cambia nada.
+3. **Audiodescripción** (`MediaBrowser.Model.dll`, `MediaStreamSelector.GetDefaultAudioStreamIndex`):
+   Emby no la distingue. Ahora las pistas cuyo idioma está en `EMBY_AUDIO_DESC_LANGS` (por defecto
+   `ads,qad`) o cuyo título contiene "audiodescrip"/"audio descrip" van al final: solo se eligen si no hay otra.
+4. **Número de pista enviado por la app al abrir el canal** (`Emby.Server.MediaEncoding.dll`,
+   `MediaInfoService.OpenMediaSource`): si la petición traía `AudioStreamIndex` (p. ej. 1, la primera pista
+   antes de conocer las del canal), Emby lo usaba en lugar de su elección por idioma. Al abrir un canal se
+   usa ahora siempre la pista elegida por el servidor. Cambiar de pista con el canal ya abierto sigue
+   respetando la que elija el usuario.
+
+Variables (en `/etc/emby-server.conf`, reiniciando `emby-server` después):
+
+    EMBY_LANG_ALIASES=esp=spa,cas=spa     # alias=código ISO 639-2, separados por comas
+    EMBY_AUDIO_DESC_LANGS=ads,qad         # códigos de idioma de pistas de audiodescripción
 
 ## Instalación
 

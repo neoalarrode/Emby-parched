@@ -41,7 +41,23 @@
 //     copias han quedado obsoletas), con el semáforo de descargas tomado para no pisar una
 //     descarga en curso e ignorando cualquier error. Si el nombre de carpeta está vacío no borra nada.
 //
-// Uso: EmbyNoShare <ruta/Emby.LiveTV.dll | ruta/Emby.Server.MediaEncoding.dll | ruta/plugin.dll> [--check]
+// Selección de pista de audio (que gane siempre el idioma preferido del usuario):
+//   lang-aliases (Emby.Server.Implementations.dll, marcador EmbyNoShare.LangAliases):
+//     LocalizationManager.FindLanguageInfosInternal solo reconoce los códigos de su tabla ISO 639
+//     (para español: spa, es, Spanish). Si el código no está, se busca en EMBY_LANG_ALIASES
+//     ("alias=código,...", por defecto esp/cas/castellano/espanol/español/castilian=spa).
+//   live-audio-language-first (Emby.Server.Implementations.dll, EmbyNoShare.LiveAudioLanguageFirst):
+//     MediaSourceManager.SetDefaultAudioStreamIndex: en streams infinitos (TV en directo) la opción
+//     "reproducir la pista predeterminada" no pasa por delante del idioma preferido.
+//   audio-description-last (MediaBrowser.Model.dll, EmbyNoShare.AudioDescriptionLast):
+//     MediaStreamSelector.GetDefaultAudioStreamIndex relega al final las pistas de audiodescripción:
+//     idioma en EMBY_AUDIO_DESC_LANGS (por defecto "ads,qad") o título con "audiodescrip"/"audio descrip".
+//   live-open-server-audio (Emby.Server.MediaEncoding.dll, EmbyNoShare.LiveOpenServerAudio):
+//     MediaInfoService.OpenMediaSource (abrir un canal, también desde PlaybackInfo con
+//     AutoOpenLiveStream) ya no pasa el AudioStreamIndex de la petición, así que se usa la pista
+//     elegida por el servidor. Cambiar de pista con el stream ya abierto sigue respetando la del cliente.
+//
+// Uso: EmbyNoShare <ruta/Emby.LiveTV.dll | ruta/Emby.Server.MediaEncoding.dll | ruta/plugin.dll | ...> [--check]
 //   --check: 0 = hay parches pendientes y todos los patrones coinciden, 3 = nada que hacer
 using Mono.Cecil;
 using Mono.Cecil.Cil;
@@ -49,7 +65,7 @@ using Mono.Cecil.Rocks;
 
 if (args.Length < 1)
 {
-    Console.Error.WriteLine("Uso: EmbyNoShare <Emby.LiveTV.dll | Emby.Server.MediaEncoding.dll | Emby.XmlTV.dll | Emby.M3UTuner.dll> [--check]");
+    Console.Error.WriteLine("Uso: EmbyNoShare <DLL de Emby o plugin> [--check]");
     return 2;
 }
 
@@ -68,6 +84,10 @@ var patches = new (string Assembly, string Marker, string Name, Func<ModuleDefin
     ("Emby.Server.MediaEncoding", "HlsHoldBack", "hls-holdback", PrepareHlsHoldBack),
     ("Emby.XmlTV", "XmlTvCacheCleanup", "xmltv-cache-cleanup", PrepareXmlTvCacheCleanup),
     ("Emby.M3UTuner", "XmlTvCacheCleanup", "xmltv-cache-cleanup", PrepareXmlTvCacheCleanup),
+    ("Emby.Server.Implementations", "LangAliases", "lang-aliases", PrepareLangAliases),
+    ("Emby.Server.Implementations", "LiveAudioLanguageFirst", "live-audio-language-first", PrepareLiveAudioLanguageFirst),
+    ("MediaBrowser.Model", "AudioDescriptionLast", "audio-description-last", PrepareAudioDescriptionLast),
+    ("Emby.Server.MediaEncoding", "LiveOpenServerAudio", "live-open-server-audio", PrepareLiveOpenServerAudio),
 };
 
 var applicable = patches.Where(x => x.Assembly == asm.Name.Name).ToList();
@@ -493,5 +513,347 @@ static Action? PrepareXmlTvCacheCleanup(ModuleDefinition module)
             CatchType = exceptionType,
         });
         method.Body.OptimizeMacros();
+    };
+}
+
+// Referencia a un método de System.String / System.Environment con el ámbito (System.Runtime o netstandard) dado
+static MethodReference Bcl(ModuleDefinition module, IMetadataScope scope, string type, string name, bool instance, TypeReference ret, params TypeReference[] args)
+{
+    var ns = type.Substring(0, type.LastIndexOf('.'));
+    var t = new TypeReference(ns, type.Substring(ns.Length + 1), module, scope, valueType: type == "System.StringComparison");
+    var m = new MethodReference(name, ret, t) { HasThis = instance };
+    foreach (var a in args) m.Parameters.Add(new ParameterDefinition(a));
+    return m;
+}
+
+static IMetadataScope ScopeOf(ModuleDefinition module, string typeFullName)
+{
+    return module.GetTypeReferences().FirstOrDefault(t => t.FullName == typeFullName)?.Scope
+        ?? throw new Exception("No se encuentra la referencia a " + typeFullName);
+}
+
+static Action? PrepareLangAliases(ModuleDefinition module)
+{
+    var lm = module.GetType("Emby.Server.Implementations.Localization.LocalizationManager") ?? throw new Exception("No se encuentra LocalizationManager");
+    var method = lm.Methods.SingleOrDefault(m => m.Name == "FindLanguageInfosInternal" && m.Parameters.Count == 1) ?? throw new Exception("No se encuentra FindLanguageInfosInternal");
+    var il = method.Body.Instructions;
+    // ldarg.0; ldfld _languageDictionary; ldarg.1; ldloca 0; callvirt TryGetValue; brfalse X; ldloc.0; ret; X: call Array.Empty<CultureDto>; ret
+    var tryGet = il.SingleOrDefault(i => i.Operand is MethodReference m && m.Name == "TryGetValue") ?? throw new Exception("Patrón inesperado en FindLanguageInfosInternal");
+    var dictField = il.Select(i => i.Operand).OfType<FieldReference>().SingleOrDefault(f => f.Name == "_languageDictionary") ?? throw new Exception("No se encuentra _languageDictionary");
+    var empty = il.SingleOrDefault(i => i.Operand is MethodReference m && m.Name == "Empty" && m.DeclaringType.FullName == "System.Array") ?? throw new Exception("No se encuentra Array.Empty");
+    if (empty.Next?.OpCode != OpCodes.Ret || method.Body.Variables.Count != 1) throw new Exception("Patrón inesperado en FindLanguageInfosInternal");
+    var scope = ScopeOf(module, "System.String");
+    Console.WriteLine($"[lang-aliases] {method.FullName}");
+
+    return () =>
+    {
+        var str = module.TypeSystem.String;
+        var i32 = module.TypeSystem.Int32;
+        var cmp = new TypeReference("System", "StringComparison", module, scope, valueType: true);
+        var getEnv = Bcl(module, scope, "System.Environment", "GetEnvironmentVariable", false, str, str);
+        var replace = Bcl(module, scope, "System.String", "Replace", true, str, str, str);
+        var concat3 = Bcl(module, scope, "System.String", "Concat", false, str, str, str, str);
+        var indexOfStr = Bcl(module, scope, "System.String", "IndexOf", true, i32, str, cmp);
+        var indexOfChar = Bcl(module, scope, "System.String", "IndexOf", true, i32, module.TypeSystem.Char, i32);
+        var substring = Bcl(module, scope, "System.String", "Substring", true, str, i32, i32);
+        var getLength = Bcl(module, scope, "System.String", "get_Length", true, i32);
+
+        // private static string EmbyNoShare_ResolveLanguageAlias(string language)
+        // {
+        //     if (language == null) return null;
+        //     string list = Environment.GetEnvironmentVariable("EMBY_LANG_ALIASES") ?? DEFAULT;
+        //     string hay = "," + list.Replace(" ", "") + ",";
+        //     string key = "," + language + "=";
+        //     int p = hay.IndexOf(key, StringComparison.OrdinalIgnoreCase);
+        //     if (p < 0) return null;
+        //     int start = p + key.Length;
+        //     return hay.Substring(start, hay.IndexOf(',', start) - start);
+        // }
+        var helper = new MethodDefinition("EmbyNoShare_ResolveLanguageAlias", MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig, str);
+        helper.Parameters.Add(new ParameterDefinition("language", ParameterAttributes.None, str));
+        var hay = new VariableDefinition(str); var key = new VariableDefinition(str); var p = new VariableDefinition(i32); var start = new VariableDefinition(i32);
+        foreach (var v in new[] { hay, key, p, start }) helper.Body.Variables.Add(v);
+        helper.Body.InitLocals = true;
+        var h = helper.Body.GetILProcessor();
+        var retNull = h.Create(OpCodes.Ldnull);
+        var haveList = h.Create(OpCodes.Ldstr, " ");
+        h.Append(h.Create(OpCodes.Ldarg_0));
+        h.Append(h.Create(OpCodes.Brfalse, retNull));
+        h.Append(h.Create(OpCodes.Ldstr, "EMBY_LANG_ALIASES"));
+        h.Append(h.Create(OpCodes.Call, getEnv));
+        h.Append(h.Create(OpCodes.Dup));
+        h.Append(h.Create(OpCodes.Brtrue, haveList));
+        h.Append(h.Create(OpCodes.Pop));
+        h.Append(h.Create(OpCodes.Ldstr, "esp=spa,cas=spa,castellano=spa,espanol=spa,español=spa,castilian=spa"));
+        h.Append(h.Create(OpCodes.Ldstr, " "));
+        var afterDefault = h.Body.Instructions.Last();
+        // (la rama con valor salta a haveList, que vuelve a cargar " "; la rama por defecto ya lo ha cargado)
+        h.Append(h.Create(OpCodes.Ldstr, ""));
+        var doReplace = h.Body.Instructions.Last();
+        h.Append(h.Create(OpCodes.Callvirt, replace));
+        h.Append(h.Create(OpCodes.Stloc, hay));
+        h.Append(h.Create(OpCodes.Ldstr, ","));
+        h.Append(h.Create(OpCodes.Ldloc, hay));
+        h.Append(h.Create(OpCodes.Ldstr, ","));
+        h.Append(h.Create(OpCodes.Call, concat3));
+        h.Append(h.Create(OpCodes.Stloc, hay));
+        h.Append(h.Create(OpCodes.Ldstr, ","));
+        h.Append(h.Create(OpCodes.Ldarg_0));
+        h.Append(h.Create(OpCodes.Ldstr, "="));
+        h.Append(h.Create(OpCodes.Call, concat3));
+        h.Append(h.Create(OpCodes.Stloc, key));
+        h.Append(h.Create(OpCodes.Ldloc, hay));
+        h.Append(h.Create(OpCodes.Ldloc, key));
+        h.Append(h.Create(OpCodes.Ldc_I4_5));
+        h.Append(h.Create(OpCodes.Callvirt, indexOfStr));
+        h.Append(h.Create(OpCodes.Stloc, p));
+        h.Append(h.Create(OpCodes.Ldloc, p));
+        h.Append(h.Create(OpCodes.Ldc_I4_0));
+        h.Append(h.Create(OpCodes.Blt, retNull));
+        h.Append(h.Create(OpCodes.Ldloc, p));
+        h.Append(h.Create(OpCodes.Ldloc, key));
+        h.Append(h.Create(OpCodes.Callvirt, getLength));
+        h.Append(h.Create(OpCodes.Add));
+        h.Append(h.Create(OpCodes.Stloc, start));
+        h.Append(h.Create(OpCodes.Ldloc, hay));
+        h.Append(h.Create(OpCodes.Ldloc, start));
+        h.Append(h.Create(OpCodes.Ldloc, hay));
+        h.Append(h.Create(OpCodes.Ldc_I4_S, (sbyte)','));
+        h.Append(h.Create(OpCodes.Ldloc, start));
+        h.Append(h.Create(OpCodes.Callvirt, indexOfChar));
+        h.Append(h.Create(OpCodes.Ldloc, start));
+        h.Append(h.Create(OpCodes.Sub));
+        h.Append(h.Create(OpCodes.Callvirt, substring));
+        h.Append(h.Create(OpCodes.Ret));
+        h.Append(retNull);
+        h.Append(h.Create(OpCodes.Ret));
+        // La rama "hay valor" debe llegar con la lista en la pila y continuar cargando " " y "":
+        // se inserta haveList justo antes del ldstr "" de la rama común y la rama por defecto salta a doReplace.
+        h.InsertBefore(doReplace, haveList);
+        h.InsertAfter(afterDefault, h.Create(OpCodes.Br, doReplace));
+        lm.Methods.Add(helper);
+
+        // FindLanguageInfosInternal: antes de devolver Array.Empty, probar el alias
+        //   string target = EmbyNoShare_ResolveLanguageAlias(language);
+        //   if (target != null && _languageDictionary.TryGetValue(target, out value)) return value;
+        method.Body.SimplifyMacros();
+        var target = new VariableDefinition(str);
+        method.Body.Variables.Add(target);
+        var mp = method.Body.GetILProcessor();
+        var value = method.Body.Variables[0];
+        var newEmpty = mp.Create(OpCodes.Call, (MethodReference)empty.Operand);
+        // la instrucción original (destino del salto) pasa a ser la primera del bloque
+        empty.OpCode = OpCodes.Ldarg_1;
+        empty.Operand = null;
+        var anchor = empty;
+        foreach (var ins in new[]
+        {
+            mp.Create(OpCodes.Call, helper),
+            mp.Create(OpCodes.Stloc, target),
+            mp.Create(OpCodes.Ldloc, target),
+            mp.Create(OpCodes.Brfalse, newEmpty),
+            mp.Create(OpCodes.Ldarg_0),
+            mp.Create(OpCodes.Ldfld, dictField),
+            mp.Create(OpCodes.Ldloc, target),
+            mp.Create(OpCodes.Ldloca, value),
+            mp.Create(OpCodes.Callvirt, (MethodReference)tryGet.Operand),
+            mp.Create(OpCodes.Brfalse, newEmpty),
+            mp.Create(OpCodes.Ldloc, value),
+            mp.Create(OpCodes.Ret),
+            newEmpty,
+        })
+        {
+            mp.InsertAfter(anchor, ins);
+            anchor = ins;
+        }
+        method.Body.OptimizeMacros();
+        helper.Body.OptimizeMacros();
+    };
+}
+
+static Action? PrepareLiveAudioLanguageFirst(ModuleDefinition module)
+{
+    var msm = module.GetType("Emby.Server.Implementations.Library.MediaSourceManager") ?? throw new Exception("No se encuentra MediaSourceManager");
+    var method = msm.Methods.SingleOrDefault(m => m.Name == "SetDefaultAudioStreamIndex" && m.Parameters.Any(pr => pr.Name == "source")) ?? throw new Exception("No se encuentra SetDefaultAudioStreamIndex");
+    var source = method.Parameters.Single(pr => pr.Name == "source");
+    if (source.ParameterType.FullName != "MediaBrowser.Model.Dto.MediaSourceInfo") throw new Exception("Tipo inesperado de source");
+    var calls = method.Body.Instructions.Where(i => i.Operand is MethodReference m && m.Name == "get_PlayDefaultAudioTrack").ToList();
+    if (calls.Count != 1) throw new Exception($"Se esperaba 1 get_PlayDefaultAudioTrack, hay {calls.Count}");
+    var call = calls[0];
+    Console.WriteLine($"[live-audio-language-first] {method.FullName} (IL_{call.Offset:x4})");
+
+    return () =>
+    {
+        var getInfinite = new MethodReference("get_IsInfiniteStream", module.TypeSystem.Boolean, source.ParameterType) { HasThis = true };
+        // preferDefaultTrack = user.Configuration.PlayDefaultAudioTrack && !source.IsInfiniteStream
+        var p = method.Body.GetILProcessor();
+        var anchor = call;
+        foreach (var ins in new[]
+        {
+            p.Create(OpCodes.Ldarg, source),
+            p.Create(OpCodes.Callvirt, getInfinite),
+            p.Create(OpCodes.Ldc_I4_0),
+            p.Create(OpCodes.Ceq),
+            p.Create(OpCodes.And),
+        })
+        {
+            p.InsertAfter(anchor, ins);
+            anchor = ins;
+        }
+    };
+}
+
+static Action? PrepareAudioDescriptionLast(ModuleDefinition module)
+{
+    var selector = module.GetType("MediaBrowser.Model.Dlna.MediaStreamSelector") ?? throw new Exception("No se encuentra MediaStreamSelector");
+    var method = selector.Methods.SingleOrDefault(m => m.Name == "GetDefaultAudioStreamIndex") ?? throw new Exception("No se encuentra GetDefaultAudioStreamIndex");
+    var streamsParam = method.Parameters.FirstOrDefault(pr => pr.Name == "streams") ?? throw new Exception("No se encuentra el parámetro streams");
+    if (streamsParam.ParameterType is not GenericInstanceType listType || listType.ElementType.FullName != "System.Collections.Generic.List`1")
+        throw new Exception("Tipo inesperado de streams");
+    var sorted = method.Body.Instructions.SingleOrDefault(i => i.Operand is MethodReference m && m.Name == "GetSortedAudioStreams") ?? throw new Exception("No se encuentra GetSortedAudioStreams");
+    var store = sorted.Next;
+    if (!(store.OpCode.Code is Code.Starg or Code.Starg_S) || store.Operand != streamsParam) throw new Exception("Patrón inesperado tras GetSortedAudioStreams: " + store);
+    var mediaStream = module.GetType("MediaBrowser.Model.Entities.MediaStream") ?? throw new Exception("No se encuentra MediaStream");
+    var getLanguage = mediaStream.Properties.Single(pr => pr.Name == "Language").GetMethod;
+    var getTitle = mediaStream.Properties.Single(pr => pr.Name == "Title").GetMethod;
+    var scope = listType.ElementType.Scope;
+    Console.WriteLine($"[audio-description-last] {method.FullName} (IL_{store.Offset:x4})");
+
+    return () =>
+    {
+        var str = module.TypeSystem.String;
+        var i32 = module.TypeSystem.Int32;
+        var cmp = new TypeReference("System", "StringComparison", module, scope, valueType: true);
+        var getEnv = Bcl(module, scope, "System.Environment", "GetEnvironmentVariable", false, str, str);
+        var concat3 = Bcl(module, scope, "System.String", "Concat", false, str, str, str, str);
+        var indexOf = Bcl(module, scope, "System.String", "IndexOf", true, i32, str, cmp);
+        // !0 de List<T>: parámetro genérico de la referencia abierta List`1
+        var open = listType.ElementType;
+        if (open.GenericParameters.Count == 0) open.GenericParameters.Add(new GenericParameter("T", open));
+        var t0 = open.GenericParameters[0];
+        MethodReference L(string name, TypeReference ret, params TypeReference[] args)
+        {
+            var m = new MethodReference(name, ret, listType) { HasThis = true };
+            foreach (var a in args) m.Parameters.Add(new ParameterDefinition(a));
+            return m;
+        }
+        var ctor = L(".ctor", module.TypeSystem.Void);
+        var count = L("get_Count", i32);
+        var item = L("get_Item", t0, i32);
+        var add = L("Add", module.TypeSystem.Void, t0);
+
+        // private static List<MediaStream> EmbyNoShare_AudioDescriptionLast(List<MediaStream> streams):
+        // misma lista con las pistas de audiodescripción al final (orden estable).
+        var helper = new MethodDefinition("EmbyNoShare_AudioDescriptionLast", MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig, listType);
+        helper.Parameters.Add(new ParameterDefinition("streams", ParameterAttributes.None, listType));
+        var res = new VariableDefinition(listType); var ad = new VariableDefinition(listType); var i = new VariableDefinition(i32);
+        var m = new VariableDefinition(mediaStream); var list = new VariableDefinition(str); var lang = new VariableDefinition(str); var title = new VariableDefinition(str);
+        foreach (var v in new[] { res, ad, i, m, list, lang, title }) helper.Body.Variables.Add(v);
+        helper.Body.InitLocals = true;
+        var h = helper.Body.GetILProcessor();
+        Instruction I(OpCode op) => h.Create(op);
+        var start = h.Create(OpCodes.Newobj, ctor);
+        var haveList = h.Create(OpCodes.Stloc, list);
+        var loop = h.Create(OpCodes.Ldarg_0);
+        var cond = h.Create(OpCodes.Ldloc, i);
+        var checkTitle = h.Create(OpCodes.Ldloc, m);
+        var notAd = h.Create(OpCodes.Ldloc, res);
+        var isAd = h.Create(OpCodes.Ldloc, ad);
+        var next = h.Create(OpCodes.Ldloc, i);
+        var loop2 = h.Create(OpCodes.Ldloc, res);
+        var cond2 = h.Create(OpCodes.Ldloc, i);
+        var seq = new List<Instruction>
+        {
+            I(OpCodes.Ldarg_0), h.Create(OpCodes.Brtrue, start), I(OpCodes.Ldnull), I(OpCodes.Ret),
+            start, h.Create(OpCodes.Stloc, res),
+            h.Create(OpCodes.Newobj, ctor), h.Create(OpCodes.Stloc, ad),
+            h.Create(OpCodes.Ldstr, ","),
+            h.Create(OpCodes.Ldstr, "EMBY_AUDIO_DESC_LANGS"), h.Create(OpCodes.Call, getEnv),
+            I(OpCodes.Dup), h.Create(OpCodes.Brtrue, h.Create(OpCodes.Nop)), // se corrige abajo
+            I(OpCodes.Pop), h.Create(OpCodes.Ldstr, "ads,qad"),
+        };
+        var skipDefault = seq[12];
+        var afterDefault = h.Create(OpCodes.Ldstr, ",");
+        skipDefault.Operand = afterDefault;
+        seq.AddRange(new[]
+        {
+            afterDefault, h.Create(OpCodes.Call, concat3), haveList,
+            h.Create(OpCodes.Ldc_I4_0), h.Create(OpCodes.Stloc, i), h.Create(OpCodes.Br, cond),
+            loop, h.Create(OpCodes.Ldloc, i), h.Create(OpCodes.Callvirt, item), h.Create(OpCodes.Stloc, m),
+            h.Create(OpCodes.Ldloc, m), h.Create(OpCodes.Callvirt, getLanguage), h.Create(OpCodes.Stloc, lang),
+            h.Create(OpCodes.Ldloc, lang), h.Create(OpCodes.Brfalse, checkTitle),
+            h.Create(OpCodes.Ldloc, list), h.Create(OpCodes.Ldstr, ","), h.Create(OpCodes.Ldloc, lang), h.Create(OpCodes.Ldstr, ","),
+            h.Create(OpCodes.Call, concat3), h.Create(OpCodes.Ldc_I4_5), h.Create(OpCodes.Callvirt, indexOf),
+            h.Create(OpCodes.Ldc_I4_0), h.Create(OpCodes.Bge, isAd),
+            checkTitle, h.Create(OpCodes.Callvirt, getTitle), h.Create(OpCodes.Stloc, title),
+            h.Create(OpCodes.Ldloc, title), h.Create(OpCodes.Brfalse, notAd),
+            h.Create(OpCodes.Ldloc, title), h.Create(OpCodes.Ldstr, "audiodescrip"), h.Create(OpCodes.Ldc_I4_5), h.Create(OpCodes.Callvirt, indexOf),
+            h.Create(OpCodes.Ldc_I4_0), h.Create(OpCodes.Bge, isAd),
+            h.Create(OpCodes.Ldloc, title), h.Create(OpCodes.Ldstr, "audio descrip"), h.Create(OpCodes.Ldc_I4_5), h.Create(OpCodes.Callvirt, indexOf),
+            h.Create(OpCodes.Ldc_I4_0), h.Create(OpCodes.Bge, isAd),
+            notAd, h.Create(OpCodes.Ldloc, m), h.Create(OpCodes.Callvirt, add), h.Create(OpCodes.Br, next),
+            isAd, h.Create(OpCodes.Ldloc, m), h.Create(OpCodes.Callvirt, add),
+            next, h.Create(OpCodes.Ldc_I4_1), h.Create(OpCodes.Add), h.Create(OpCodes.Stloc, i),
+            cond, h.Create(OpCodes.Ldarg_0), h.Create(OpCodes.Callvirt, count), h.Create(OpCodes.Blt, loop),
+            h.Create(OpCodes.Ldc_I4_0), h.Create(OpCodes.Stloc, i), h.Create(OpCodes.Br, cond2),
+            loop2, h.Create(OpCodes.Ldloc, ad), h.Create(OpCodes.Ldloc, i), h.Create(OpCodes.Callvirt, item), h.Create(OpCodes.Callvirt, add),
+            h.Create(OpCodes.Ldloc, i), h.Create(OpCodes.Ldc_I4_1), h.Create(OpCodes.Add), h.Create(OpCodes.Stloc, i),
+            cond2, h.Create(OpCodes.Ldloc, ad), h.Create(OpCodes.Callvirt, count), h.Create(OpCodes.Blt, loop2),
+            h.Create(OpCodes.Ldloc, res), h.Create(OpCodes.Ret),
+        });
+        foreach (var ins in seq) h.Append(ins);
+        selector.Methods.Add(helper);
+
+        // GetDefaultAudioStreamIndex: streams = GetSortedAudioStreams(...); streams = EmbyNoShare_AudioDescriptionLast(streams);
+        var p = method.Body.GetILProcessor();
+        var anchor = store;
+        foreach (var ins in new[]
+        {
+            p.Create(OpCodes.Ldarg, streamsParam),
+            p.Create(OpCodes.Call, helper),
+            p.Create(OpCodes.Starg, streamsParam),
+        })
+        {
+            p.InsertAfter(anchor, ins);
+            anchor = ins;
+        }
+        helper.Body.OptimizeMacros();
+    };
+}
+
+static Action? PrepareLiveOpenServerAudio(ModuleDefinition module)
+{
+    var service = module.GetType("Emby.Server.MediaEncoding.Api.MediaInfoService") ?? throw new Exception("No se encuentra MediaInfoService");
+    var moveNext = GetMoveNext(service, "OpenMediaSource");
+    var gets = moveNext.Body.Instructions.Where(i => i.Operand is MethodReference m && m.Name == "get_AudioStreamIndex" && m.DeclaringType.Name == "LiveStreamRequest").ToList();
+    if (gets.Count != 1) throw new Exception($"Se esperaba 1 LiveStreamRequest.get_AudioStreamIndex en OpenMediaSource, hay {gets.Count}");
+    var get = gets[0];
+    // Debe ser un argumento de SetDeviceSpecificData (sin otro uso entre medias)
+    var next = get.Next;
+    while (next != null && !(next.Operand is MethodReference mr && (mr.Name == "SetDeviceSpecificData" || mr.Name.Contains("AwaitUnsafeOnCompleted"))))
+        next = next.Next;
+    if (next == null || ((MethodReference)next.Operand).Name != "SetDeviceSpecificData") throw new Exception("AudioStreamIndex no va a SetDeviceSpecificData");
+    Console.WriteLine($"[live-open-server-audio] {moveNext.FullName} (IL_{get.Offset:x4})");
+
+    return () =>
+    {
+        // request.AudioStreamIndex -> (int?)null  (se descarta el valor de la petición)
+        var nullable = ((MethodReference)get.Operand).ReturnType;
+        var tmp = new VariableDefinition(nullable);
+        moveNext.Body.Variables.Add(tmp);
+        moveNext.Body.InitLocals = true;
+        var p = moveNext.Body.GetILProcessor();
+        var anchor = get;
+        foreach (var ins in new[]
+        {
+            p.Create(OpCodes.Pop),
+            p.Create(OpCodes.Ldloca, tmp),
+            p.Create(OpCodes.Initobj, nullable),
+            p.Create(OpCodes.Ldloc, tmp),
+        })
+        {
+            p.InsertAfter(anchor, ins);
+            anchor = ins;
+        }
     };
 }

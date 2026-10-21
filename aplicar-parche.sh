@@ -2,6 +2,8 @@
 # Aplica los parches de Live TV sobre una instalación existente de Emby Server:
 #   Emby.LiveTV.dll                -> sin compartición de streams (+ TARGETDURATION en 4.10)
 #   Emby.Server.MediaEncoding.dll  -> margen HLS para Fire TV con Vega OS (EMBY_HLS_HOLDBACK)
+#   Emby.Server.Implementations.dll, MediaBrowser.Model.dll (+ MediaEncoding) -> selección de la pista
+#                                     de audio por idioma (alias esp..., audiodescripción al final, TV en directo)
 #   plugins Emby.XmlTV.dll y Emby.M3UTuner.dll (si están instalados) -> borrar las copias
 #                                     antiguas de la guía XMLTV en cada actualización
 # Solo aplica los parches que falten.
@@ -17,8 +19,8 @@ case "$(uname -m)" in
 esac
 
 # DLL a revisar: las de Emby son obligatorias; los plugins, solo si están instalados
-FILES="$SYS/Emby.LiveTV.dll $SYS/Emby.Server.MediaEncoding.dll"
-for F in "$SYS/Emby.LiveTV.dll" "$SYS/Emby.Server.MediaEncoding.dll"; do
+FILES="$SYS/Emby.LiveTV.dll $SYS/Emby.Server.MediaEncoding.dll $SYS/Emby.Server.Implementations.dll $SYS/MediaBrowser.Model.dll"
+for F in $FILES; do
   [ -f "$F" ] || { echo "No existe $F"; exit 1; }
 done
 for F in "$PLUGINS/Emby.XmlTV.dll" "$PLUGINS/Emby.M3UTuner.dll"; do
