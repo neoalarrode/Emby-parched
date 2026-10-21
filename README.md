@@ -81,7 +81,16 @@ Efecto secundario: el Fire irá ~30 s por detrás del directo.
 
 ## Instalación
 
-Compila el parcheador (requiere el SDK de .NET 8, solo en la máquina donde compiles):
+Desde la última release (ya compilado, no requiere .NET):
+
+    cd /tmp
+    curl -fsSL -o emby-parched-linux.tar.gz \
+      https://github.com/neoalarrode/Emby-parched/releases/latest/download/emby-parched-linux.tar.gz
+    tar xzf emby-parched-linux.tar.gz
+    cd emby-parched
+    sudo ./aplicar-parche.sh
+
+O compilándolo tú (requiere el SDK de .NET 8, solo en la máquina donde compiles):
 
     ./build.sh
 
@@ -118,6 +127,7 @@ Este repositorio no incluye binarios de Emby: el parche se aplica sobre tu propi
 
 - `src/`: parcheador (`EmbyNoShare`, Mono.Cecil).
 - `aplicar-parche.sh`: aplica el parche sobre una instalación existente.
+- `.github/workflows/release.yml`: al crear una etiqueta `v*` compila y publica la release.
 - `build.sh`: compila el parcheador como binario autónomo para linux-x64 y linux-arm64.
 - `tools/emby-sesiones.sh`: diagnóstico a partir de los logs de Emby. Sin argumentos lista las sesiones
   de reproducción (dispositivo, app, canal, PlaySessionId); con un PlaySessionId muestra IP, motivos de

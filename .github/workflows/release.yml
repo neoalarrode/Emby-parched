@@ -1,0 +1,38 @@
+name: release
+
+# Al crear una etiqueta v* compila el parcheador (linux-x64 y linux-arm64) y publica
+# emby-parched-linux.tar.gz como release, listo para ejecutar aplicar-parche.sh.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Compilar
+        run: ./build.sh
+
+      - name: Empaquetar
+        run: |
+          mkdir -p dist/emby-parched
+          cp -r aplicar-parche.sh README.md bin tools dist/emby-parched/
+          tar -C dist -czf emby-parched-linux.tar.gz emby-parched
+          tar -tzvf emby-parched-linux.tar.gz
+
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" emby-parched-linux.tar.gz \
+            --title "$GITHUB_REF_NAME" \
+            --notes "Kit listo para usar: descomprimir y ejecutar \`sudo ./aplicar-parche.sh\`. Ver README."
