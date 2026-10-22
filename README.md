@@ -12,6 +12,8 @@ Parches para Emby Server (probados con 4.10.2.0 y 4.11.0.9):
 4. **Caché de la guía XMLTV**: los plugins "Xml TV" y M3U dejan de acumular una copia de la guía por cada
    actualización.
 5. **Pista de audio según el idioma del perfil** en canales con varias pistas (`esp`, `ads`, `qaa`…).
+6. **Robustez de la TV en directo**: abrir un canal no bloquea al resto, cierre de streams huérfanos,
+   reconexiones más tolerantes con el proveedor y ventana deslizante en el HLS convertido (disco acotado).
 
 El parcheador aplica solo los parches que falten (y omite los que la versión de Emby ya no necesita), así que se puede ejecutar sobre una instalación ya parcheada.
 
@@ -124,6 +126,38 @@ Variables (en `/etc/emby-server.conf`, reiniciando `emby-server` después):
 
     EMBY_LANG_ALIASES=esp=spa,cas=spa     # alias=código ISO 639-2, separados por comas
     EMBY_AUDIO_DESC_LANGS=ads,qad         # códigos de idioma de pistas de audiodescripción
+
+## Parche 6: robustez de la TV en directo
+
+1. **Abrir un canal sin bloquear al resto** (`Emby.Server.Implementations.dll`,
+   `MediaSourceManager.OpenLiveStreamInternal2`): Emby retenía un semáforo global durante toda la apertura de
+   un canal (conexión con el proveedor, espera del buffer, ffprobe), así que mientras un cliente abría un canal
+   lento, cualquier otro cliente que abriera o cerrara un canal esperaba. Sin compartición de streams no hace
+   falta (los streams se guardan en un `ConcurrentDictionary`): ahora las aperturas van en paralelo. Cerrar
+   streams sigue usando el semáforo.
+2. **Cerrar streams huérfanos** (`Emby.LiveTV.dll`, `SharedHttpPipelineSource`): si una app se cierra sin
+   avisar (Fire TV que se apaga, app que se mata), Emby nunca cerraba el stream: seguía descargando del proveedor
+   y escribiendo el buffer en disco indefinidamente, ocupando una conexión de Dispatcharr. Ahora cada stream
+   anota cuándo lo leyó alguien por última vez (stream `.ts`, playlists y segmentos HLS) y, si nadie lo lee en
+   `EMBY_LIVE_IDLE_MINUTES` minutos (por defecto 20), se cierra igual que cuando el cliente para. En el log:
+   `EmbyNoShare: nadie lee el stream ... se cierra`. Las grabaciones leen continuamente, así que no les afecta;
+   una pausa de más de esos minutos sí cierra el canal (al reanudar, la app lo vuelve a abrir).
+3. **Reconexiones más tolerantes** (`Emby.LiveTV.dll`, `LimitingRetryHandler`): cuando el proveedor corta la
+   conexión, Emby reconecta, pero como mucho 2 veces en 5 minutos, 4 en 30 y 6 en una hora; a la siguiente
+   cerraba el canal ("Shut down stream ... does not allow more than ..."). Ahora esos límites se multiplican por
+   `EMBY_LIVE_RECONNECT_FACTOR` (por defecto 5: 10 / 20 / 30). `1` deja los de Emby.
+4. **Ventana deslizante en el HLS convertido** (`Emby.Server.MediaEncoding.dll`, `BaseHlsService.GetLivePlaylistText`):
+   cuando Emby convierte un canal a HLS con ffmpeg (Fire TV), la playlist era de tipo EVENT y nunca borraba
+   segmentos: la carpeta de transcodificación crecía sin parar (del orden de 1 GB por hora, según la calidad) y la playlist, que el cliente descarga cada
+   pocos segundos, también. Ahora la playlist contiene solo los últimos `EMBY_LIVE_HLS_WINDOW_MINUTES` minutos
+   (por defecto 30), con `#EXT-X-MEDIA-SEQUENCE` correcto, y los segmentos que salen de la ventana se borran del
+   disco. `0` deja el comportamiento original.
+
+Variables (en `/etc/emby-server.conf`, reiniciando `emby-server` después):
+
+    EMBY_LIVE_IDLE_MINUTES=20          # minutos sin lectores para cerrar un stream; 0 lo desactiva
+    EMBY_LIVE_RECONNECT_FACTOR=5       # multiplica los límites de reconexión; 1 = los de Emby
+    EMBY_LIVE_HLS_WINDOW_MINUTES=30    # minutos que conserva el HLS convertido; 0 = sin límite (original)
 
 ## Instalación
 

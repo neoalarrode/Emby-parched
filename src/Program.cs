@@ -57,6 +57,27 @@
 //     AutoOpenLiveStream) ya no pasa el AudioStreamIndex de la petición, así que se usa la pista
 //     elegida por el servidor. Cambiar de pista con el stream ya abierto sigue respetando la del cliente.
 //
+// Robustez de TV en directo:
+//   live-open-no-global-lock (Emby.Server.Implementations.dll, EmbyNoShare.LiveOpenNoGlobalLock):
+//     MediaSourceManager.OpenLiveStreamInternal2 retenía el semáforo global _liveStreamSemaphore
+//     durante toda la apertura de un canal (conexión, espera del buffer, ffprobe), así que abrir o
+//     cerrar cualquier otro canal esperaba. Sin compartición de streams no hace falta: los streams
+//     se guardan en un ConcurrentDictionary. Se elimina la espera y la liberación en ese método
+//     (cerrar streams sigue usando el semáforo entre sí).
+//   live-idle-close (Emby.LiveTV.dll, EmbyNoShare.LiveIdleClose):
+//     Si una app desaparece sin parar la reproducción, el stream seguía abierto para siempre (conexión con el
+//     proveedor y buffer en disco). SharedHttpPipelineSource.GetSegments (lo usan todos los lectores) anota la
+//     hora de lectura en LiveStream.EmbyNoShare_LastRead; OnSegmentCompleted comprueba si nadie lee desde hace
+//     EMBY_LIVE_IDLE_MINUTES (por defecto 20; 0 lo desactiva) y lo cierra con MediaSourceManager.CloseLiveStream.
+//   live-reconnect-factor (Emby.LiveTV.dll, EmbyNoShare.LiveReconnectFactor):
+//     LimitingRetryHandler.Add multiplica el máximo de reconexiones por EMBY_LIVE_RECONNECT_FACTOR (por
+//     defecto 5). Emby solo permitía 2 reconexiones en 5 min, 4 en 30 min y 6 en 1 h antes de cerrar el canal.
+// Emby.Server.MediaEncoding.dll
+//   live-hls-window (marcador EmbyNoShare.LiveHlsWindow):
+//     BaseHlsService.GetLivePlaylistText (HLS convertido con ffmpeg) era una playlist EVENT que nunca borraba
+//     segmentos. Ahora solo lista los últimos EMBY_LIVE_HLS_WINDOW_MINUTES (por defecto 30; 0 = original), sin
+//     EVENT y con MEDIA-SEQUENCE igual a los segmentos descartados, y borra del disco los que salen de la ventana.
+//
 // Uso: EmbyNoShare <ruta/Emby.LiveTV.dll | ruta/Emby.Server.MediaEncoding.dll | ruta/plugin.dll | ...> [--check]
 //   --check: 0 = hay parches pendientes y todos los patrones coinciden, 3 = nada que hacer
 using Mono.Cecil;
@@ -88,6 +109,10 @@ var patches = new (string Assembly, string Marker, string Name, Func<ModuleDefin
     ("Emby.Server.Implementations", "LiveAudioLanguageFirst", "live-audio-language-first", PrepareLiveAudioLanguageFirst),
     ("MediaBrowser.Model", "AudioDescriptionLast", "audio-description-last", PrepareAudioDescriptionLast),
     ("Emby.Server.MediaEncoding", "LiveOpenServerAudio", "live-open-server-audio", PrepareLiveOpenServerAudio),
+    ("Emby.Server.Implementations", "LiveOpenNoGlobalLock", "live-open-no-global-lock", PrepareLiveOpenNoGlobalLock),
+    ("Emby.LiveTV", "LiveIdleClose", "live-idle-close", PrepareLiveIdleClose),
+    ("Emby.LiveTV", "LiveReconnectFactor", "live-reconnect-factor", PrepareLiveReconnectFactor),
+    ("Emby.Server.MediaEncoding", "LiveHlsWindow", "live-hls-window", PrepareLiveHlsWindow),
 };
 
 var applicable = patches.Where(x => x.Assembly == asm.Name.Name).ToList();
@@ -856,4 +881,516 @@ static Action? PrepareLiveOpenServerAudio(ModuleDefinition module)
             anchor = ins;
         }
     };
+}
+
+static Action? PrepareLiveOpenNoGlobalLock(ModuleDefinition module)
+{
+    var msm = module.GetType("Emby.Server.Implementations.Library.MediaSourceManager") ?? throw new Exception("No se encuentra MediaSourceManager");
+    var moveNext = GetMoveNext(msm, "OpenLiveStreamInternal2");
+    var il = moveNext.Body.Instructions;
+    bool IsSem(Instruction i) => i.Operand is FieldReference f && f.Name == "_liveStreamSemaphore";
+    var waits = il.Where(i => i.Operand is MethodReference m && m.Name == "WaitAsync" && m.DeclaringType.FullName == "System.Threading.SemaphoreSlim").ToList();
+    var releases = il.Where(i => i.Operand is MethodReference m && m.Name == "Release" && m.DeclaringType.FullName == "System.Threading.SemaphoreSlim").ToList();
+    if (waits.Count != 1 || releases.Count != 1) throw new Exception($"Se esperaba 1 WaitAsync y 1 Release, hay {waits.Count} y {releases.Count}");
+    var wait = waits[0]; var release = releases[0];
+    var waitRef = (MethodReference)wait.Operand;
+    if (waitRef.Parameters.Count != 1 || waitRef.Parameters[0].ParameterType.FullName != "System.Threading.CancellationToken")
+        throw new Exception("Firma inesperada de WaitAsync");
+    if (!IsSem(release.Previous) || release.Next.OpCode != OpCodes.Pop) throw new Exception("Patrón inesperado en Release");
+    // El semáforo de WaitAsync tiene que ser _liveStreamSemaphore
+    var j = wait.Previous; int guard = 0;
+    while (j != null && !IsSem(j) && guard++ < 8) j = j.Previous;
+    if (j == null || !IsSem(j)) throw new Exception("WaitAsync no es sobre _liveStreamSemaphore");
+    Console.WriteLine($"[live-open-no-global-lock] {moveNext.FullName} (IL_{wait.Offset:x4}, IL_{release.Offset:x4})");
+
+    return () =>
+    {
+        var task = waitRef.ReturnType; // System.Threading.Tasks.Task
+        var completed = new MethodReference("get_CompletedTask", task, task) { HasThis = false };
+        moveNext.Body.SimplifyMacros();
+        var p = moveNext.Body.GetILProcessor();
+        // semaphore.WaitAsync(token)  ->  pop token; pop semaphore; Task.CompletedTask
+        wait.OpCode = OpCodes.Pop; wait.Operand = null;
+        var pop2 = p.Create(OpCodes.Pop);
+        p.InsertAfter(wait, pop2);
+        p.InsertAfter(pop2, p.Create(OpCodes.Call, completed));
+        // semaphore.Release() (resultado descartado)  ->  pop semaphore; ldc.i4.0
+        release.OpCode = OpCodes.Pop; release.Operand = null;
+        p.InsertAfter(release, p.Create(OpCodes.Ldc_I4_0));
+        moveNext.Body.OptimizeMacros();
+    };
+}
+
+static Action? PrepareLiveIdleClose(ModuleDefinition module)
+{
+    var ls = module.GetType("Emby.LiveTV.TunerHosts.LiveStream") ?? throw new Exception("No se encuentra LiveStream");
+    var pipe = module.GetType("Emby.LiveTV.TunerHosts.SharedHttpPipelineSource") ?? throw new Exception("No se encuentra SharedHttpPipelineSource");
+    var consumers = ls.Fields.SingleOrDefault(f => f.Name == "Consumers") ?? throw new Exception("No se encuentra LiveStream.Consumers");
+    var logger = ls.Fields.SingleOrDefault(f => f.Name == "Logger") ?? throw new Exception("No se encuentra LiveStream.Logger");
+    var getMediaSource = ls.Properties.SingleOrDefault(p => p.Name == "MediaSource")?.GetMethod ?? throw new Exception("No se encuentra LiveStream.MediaSource");
+    var getSegments = pipe.Methods.SingleOrDefault(m => m.Name == "GetSegments" && m.Parameters.Count == 0 && m.HasBody) ?? throw new Exception("No se encuentra GetSegments");
+    var onCompleted = pipe.Methods.SingleOrDefault(m => m.Name == "OnSegmentCompleted" && m.Parameters.Count == 1 && m.HasBody) ?? throw new Exception("No se encuentra OnSegmentCompleted");
+    // Referencias que el ensamblado ya usa
+    var refs = module.GetMemberReferences().OfType<MethodReference>().ToList();
+    MethodReference Ref(string declaring, string name, int args) => refs.FirstOrDefault(m => m.DeclaringType.FullName == declaring && m.Name == name && m.Parameters.Count == args)
+        ?? throw new Exception($"No se encuentra la referencia {declaring}::{name}");
+    var getLiveStreamId = Ref("MediaBrowser.Model.Dto.MediaSourceInfo", "get_LiveStreamId", 0);
+    var getMsm = Ref("MediaBrowser.Controller.Entities.BaseItem", "get_MediaSourceManager", 0);
+    var info = refs.FirstOrDefault(m => m.DeclaringType.FullName == "MediaBrowser.Model.Logging.ILogger" && m.Name == "Info" && m.Parameters.Count == 2 && m.Parameters[1].ParameterType.IsArray)
+        ?? throw new Exception("No se encuentra ILogger.Info(string, object[])");
+    var task = refs.Select(m => m.ReturnType).FirstOrDefault(t => t.FullName == "System.Threading.Tasks.Task")
+        ?? throw new Exception("No se encuentra System.Threading.Tasks.Task");
+    if (ls.Fields.Any(f => f.Name == "EmbyNoShare_LastRead")) throw new Exception("Campo EmbyNoShare_LastRead ya existe");
+    Console.WriteLine($"[live-idle-close] {getSegments.FullName}, {onCompleted.FullName}");
+
+    return () =>
+    {
+        var ts = module.TypeSystem;
+        var runtime = task.Scope;
+        var closeLive = new MethodReference("CloseLiveStream", task, getMsm.ReturnType) { HasThis = true };
+        closeLive.Parameters.Add(new ParameterDefinition(ts.String));
+        closeLive.Parameters.Add(new ParameterDefinition(ts.String));
+        var clear = new MethodReference("Clear", ts.Void, consumers.FieldType) { HasThis = true };
+        var tick = Bcl(module, runtime, "System.Environment", "get_TickCount64", false, ts.Int64);
+        var getEnv = Bcl(module, runtime, "System.Environment", "GetEnvironmentVariable", false, ts.String, ts.String);
+        var int32 = new TypeReference("System", "Int32", module, runtime, valueType: true);
+        var tryParse = new MethodReference("TryParse", ts.Boolean, int32) { HasThis = false };
+        tryParse.Parameters.Add(new ParameterDefinition(ts.String));
+        tryParse.Parameters.Add(new ParameterDefinition(new ByReferenceType(ts.Int32)));
+        var funcOpen = new TypeReference("System", "Func`1", module, runtime, valueType: false);
+        funcOpen.GenericParameters.Add(new GenericParameter("TResult", funcOpen));
+        var funcTask = new GenericInstanceType(funcOpen);
+        funcTask.GenericArguments.Add(task);
+        var funcCtor = new MethodReference(".ctor", ts.Void, funcTask) { HasThis = true };
+        funcCtor.Parameters.Add(new ParameterDefinition(ts.Object));
+        funcCtor.Parameters.Add(new ParameterDefinition(ts.IntPtr));
+        var run = new MethodReference("Run", task, task) { HasThis = false };
+        run.Parameters.Add(new ParameterDefinition(funcTask));
+
+        // public long EmbyNoShare_LastRead;  (Environment.TickCount64 de la última lectura)
+        var last = new FieldDefinition("EmbyNoShare_LastRead", FieldAttributes.Public, ts.Int64);
+        ls.Fields.Add(last);
+
+        // public Task EmbyNoShare_CloseIdle()
+        // {
+        //     Consumers.Clear();
+        //     return BaseItem.MediaSourceManager.CloseLiveStream(MediaSource.LiveStreamId, "EmbyNoShare-idle");
+        // }
+        var closeIdle = new MethodDefinition("EmbyNoShare_CloseIdle", MethodAttributes.Public | MethodAttributes.HideBySig, task);
+        var c = closeIdle.Body.GetILProcessor();
+        c.Append(c.Create(OpCodes.Ldarg_0));
+        c.Append(c.Create(OpCodes.Ldfld, consumers));
+        c.Append(c.Create(OpCodes.Callvirt, clear));
+        c.Append(c.Create(OpCodes.Call, getMsm));
+        c.Append(c.Create(OpCodes.Ldarg_0));
+        c.Append(c.Create(OpCodes.Call, getMediaSource));
+        c.Append(c.Create(OpCodes.Callvirt, getLiveStreamId));
+        c.Append(c.Create(OpCodes.Ldstr, "EmbyNoShare-idle"));
+        c.Append(c.Create(OpCodes.Callvirt, closeLive));
+        c.Append(c.Create(OpCodes.Ret));
+        ls.Methods.Add(closeIdle);
+
+        // public void EmbyNoShare_CheckIdle()
+        // {
+        //     long now = Environment.TickCount64;
+        //     if (EmbyNoShare_LastRead == 0) { EmbyNoShare_LastRead = now; return; }
+        //     string s = Environment.GetEnvironmentVariable("EMBY_LIVE_IDLE_MINUTES") ?? "20";
+        //     if (!int.TryParse(s, out int m) || m <= 0) return;
+        //     if (now - EmbyNoShare_LastRead < (long)m * 60000) return;
+        //     string id = MediaSource.LiveStreamId;
+        //     if (id == null) return;
+        //     EmbyNoShare_LastRead = now;
+        //     Logger.Info("EmbyNoShare: nadie lee el stream {0} desde hace {1} min, se cierra", id, m);
+        //     Task.Run(new Func<Task>(EmbyNoShare_CloseIdle));
+        // }
+        var check = new MethodDefinition("EmbyNoShare_CheckIdle", MethodAttributes.Public | MethodAttributes.HideBySig, ts.Void);
+        var now = new VariableDefinition(ts.Int64);
+        var s = new VariableDefinition(ts.String);
+        var m = new VariableDefinition(ts.Int32);
+        var id = new VariableDefinition(ts.String);
+        foreach (var v in new[] { now, s, m, id }) check.Body.Variables.Add(v);
+        check.Body.InitLocals = true;
+        var h = check.Body.GetILProcessor();
+        var ret = h.Create(OpCodes.Ret);
+        var notFirst = h.Create(OpCodes.Ldstr, "EMBY_LIVE_IDLE_MINUTES");
+        var haveS = h.Create(OpCodes.Ldloc, s);
+        h.Append(h.Create(OpCodes.Call, tick));
+        h.Append(h.Create(OpCodes.Stloc, now));
+        h.Append(h.Create(OpCodes.Ldarg_0));
+        h.Append(h.Create(OpCodes.Ldfld, last));
+        h.Append(h.Create(OpCodes.Brtrue, notFirst));
+        h.Append(h.Create(OpCodes.Ldarg_0));
+        h.Append(h.Create(OpCodes.Ldloc, now));
+        h.Append(h.Create(OpCodes.Stfld, last));
+        h.Append(h.Create(OpCodes.Ret));
+        h.Append(notFirst);
+        h.Append(h.Create(OpCodes.Call, getEnv));
+        h.Append(h.Create(OpCodes.Stloc, s));
+        h.Append(h.Create(OpCodes.Ldloc, s));
+        h.Append(h.Create(OpCodes.Brtrue, haveS));
+        h.Append(h.Create(OpCodes.Ldstr, "20"));
+        h.Append(h.Create(OpCodes.Stloc, s));
+        h.Append(haveS);
+        h.Append(h.Create(OpCodes.Ldloca, m));
+        h.Append(h.Create(OpCodes.Call, tryParse));
+        h.Append(h.Create(OpCodes.Brfalse, ret));
+        h.Append(h.Create(OpCodes.Ldloc, m));
+        h.Append(h.Create(OpCodes.Ldc_I4_0));
+        h.Append(h.Create(OpCodes.Ble, ret));
+        h.Append(h.Create(OpCodes.Ldloc, now));
+        h.Append(h.Create(OpCodes.Ldarg_0));
+        h.Append(h.Create(OpCodes.Ldfld, last));
+        h.Append(h.Create(OpCodes.Sub));
+        h.Append(h.Create(OpCodes.Ldloc, m));
+        h.Append(h.Create(OpCodes.Conv_I8));
+        h.Append(h.Create(OpCodes.Ldc_I4, 60000));
+        h.Append(h.Create(OpCodes.Conv_I8));
+        h.Append(h.Create(OpCodes.Mul));
+        h.Append(h.Create(OpCodes.Blt, ret));
+        h.Append(h.Create(OpCodes.Ldarg_0));
+        h.Append(h.Create(OpCodes.Call, getMediaSource));
+        h.Append(h.Create(OpCodes.Callvirt, getLiveStreamId));
+        h.Append(h.Create(OpCodes.Stloc, id));
+        h.Append(h.Create(OpCodes.Ldloc, id));
+        h.Append(h.Create(OpCodes.Brfalse, ret));
+        h.Append(h.Create(OpCodes.Ldarg_0));
+        h.Append(h.Create(OpCodes.Ldloc, now));
+        h.Append(h.Create(OpCodes.Stfld, last));
+        h.Append(h.Create(OpCodes.Ldarg_0));
+        h.Append(h.Create(OpCodes.Ldfld, logger));
+        h.Append(h.Create(OpCodes.Ldstr, "EmbyNoShare: nadie lee el stream {0} desde hace {1} min, se cierra"));
+        h.Append(h.Create(OpCodes.Ldc_I4_2));
+        h.Append(h.Create(OpCodes.Newarr, ts.Object));
+        h.Append(h.Create(OpCodes.Dup));
+        h.Append(h.Create(OpCodes.Ldc_I4_0));
+        h.Append(h.Create(OpCodes.Ldloc, id));
+        h.Append(h.Create(OpCodes.Stelem_Ref));
+        h.Append(h.Create(OpCodes.Dup));
+        h.Append(h.Create(OpCodes.Ldc_I4_1));
+        h.Append(h.Create(OpCodes.Ldloc, m));
+        h.Append(h.Create(OpCodes.Box, int32));
+        h.Append(h.Create(OpCodes.Stelem_Ref));
+        h.Append(h.Create(OpCodes.Callvirt, info));
+        h.Append(h.Create(OpCodes.Ldarg_0));
+        h.Append(h.Create(OpCodes.Ldftn, closeIdle));
+        h.Append(h.Create(OpCodes.Newobj, funcCtor));
+        h.Append(h.Create(OpCodes.Call, run));
+        h.Append(h.Create(OpCodes.Pop));
+        h.Append(ret);
+        check.Body.OptimizeMacros();
+        ls.Methods.Add(check);
+
+        // GetSegments() (lo usan todos los lectores: stream.ts, playlists y segmentos HLS):
+        //   EmbyNoShare_LastRead = Environment.TickCount64;
+        var first = getSegments.Body.Instructions[0];
+        var g = getSegments.Body.GetILProcessor();
+        g.InsertBefore(first, g.Create(OpCodes.Ldarg_0));
+        g.InsertBefore(first, g.Create(OpCodes.Call, tick));
+        g.InsertBefore(first, g.Create(OpCodes.Stfld, last));
+        // OnSegmentCompleted(file): EmbyNoShare_CheckIdle(); al principio
+        var o = onCompleted.Body.GetILProcessor();
+        var firstO = onCompleted.Body.Instructions[0];
+        o.InsertBefore(firstO, o.Create(OpCodes.Ldarg_0));
+        o.InsertBefore(firstO, o.Create(OpCodes.Call, check));
+    };
+}
+
+static Action? PrepareLiveReconnectFactor(ModuleDefinition module)
+{
+    var handler = module.GetType("Emby.LiveTV.TunerHosts.LimitingRetryHandler") ?? throw new Exception("No se encuentra LimitingRetryHandler");
+    var add = handler.Methods.SingleOrDefault(m => m.Name == "Add" && m.Parameters.Count == 2 && m.Parameters[1].ParameterType.FullName == "System.Int32")
+        ?? throw new Exception("No se encuentra LimitingRetryHandler.Add(TimeSpan, int)");
+    // ldarg.0; ldfld allowedRetries; ldarg.1; ldarg.2; callvirt SortedDictionary::Add; ret
+    var loads = add.Body.Instructions.Where(i => i.OpCode == OpCodes.Ldarg_2).ToList();
+    if (loads.Count != 1 || !(loads[0].Next.Operand is MethodReference m && m.Name == "Add"))
+        throw new Exception("Patrón inesperado en LimitingRetryHandler.Add");
+    var load = loads[0];
+    var scope = module.TypeSystem.CoreLibrary; // System.Runtime
+    Console.WriteLine($"[live-reconnect-factor] {add.FullName}");
+
+    return () =>
+    {
+        var ts = module.TypeSystem;
+        var getEnv = Bcl(module, scope, "System.Environment", "GetEnvironmentVariable", false, ts.String, ts.String);
+        var int32 = new TypeReference("System", "Int32", module, scope, valueType: true);
+        var tryParse = new MethodReference("TryParse", ts.Boolean, int32) { HasThis = false };
+        tryParse.Parameters.Add(new ParameterDefinition(ts.String));
+        tryParse.Parameters.Add(new ParameterDefinition(new ByReferenceType(ts.Int32)));
+
+        // private static int EmbyNoShare_ScaleRetries(int n)
+        // {
+        //     string s = Environment.GetEnvironmentVariable("EMBY_LIVE_RECONNECT_FACTOR") ?? "5";
+        //     if (!int.TryParse(s, out int f) || f < 1 || f > 1000) return n;
+        //     return n * f;
+        // }
+        var helper = new MethodDefinition("EmbyNoShare_ScaleRetries", MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig, ts.Int32);
+        helper.Parameters.Add(new ParameterDefinition("n", ParameterAttributes.None, ts.Int32));
+        var s = new VariableDefinition(ts.String);
+        var f = new VariableDefinition(ts.Int32);
+        helper.Body.Variables.Add(s);
+        helper.Body.Variables.Add(f);
+        helper.Body.InitLocals = true;
+        var h = helper.Body.GetILProcessor();
+        var retN = h.Create(OpCodes.Ldarg_0);
+        var haveS = h.Create(OpCodes.Ldloc, s);
+        h.Append(h.Create(OpCodes.Ldstr, "EMBY_LIVE_RECONNECT_FACTOR"));
+        h.Append(h.Create(OpCodes.Call, getEnv));
+        h.Append(h.Create(OpCodes.Stloc, s));
+        h.Append(h.Create(OpCodes.Ldloc, s));
+        h.Append(h.Create(OpCodes.Brtrue, haveS));
+        h.Append(h.Create(OpCodes.Ldstr, "5"));
+        h.Append(h.Create(OpCodes.Stloc, s));
+        h.Append(haveS);
+        h.Append(h.Create(OpCodes.Ldloca, f));
+        h.Append(h.Create(OpCodes.Call, tryParse));
+        h.Append(h.Create(OpCodes.Brfalse, retN));
+        h.Append(h.Create(OpCodes.Ldloc, f));
+        h.Append(h.Create(OpCodes.Ldc_I4_1));
+        h.Append(h.Create(OpCodes.Blt, retN));
+        h.Append(h.Create(OpCodes.Ldloc, f));
+        h.Append(h.Create(OpCodes.Ldc_I4, 1000));
+        h.Append(h.Create(OpCodes.Bgt, retN));
+        h.Append(h.Create(OpCodes.Ldarg_0));
+        h.Append(h.Create(OpCodes.Ldloc, f));
+        h.Append(h.Create(OpCodes.Mul));
+        h.Append(h.Create(OpCodes.Ret));
+        h.Append(retN);
+        h.Append(h.Create(OpCodes.Ret));
+        helper.Body.OptimizeMacros();
+        handler.Methods.Add(helper);
+
+        // allowedRetries.Add(timeSpan, EmbyNoShare_ScaleRetries(maxRetryCount))
+        add.Body.GetILProcessor().InsertAfter(load, Instruction.Create(OpCodes.Call, helper));
+    };
+}
+
+static Action? PrepareLiveHlsWindow(ModuleDefinition module)
+{
+    var service = module.GetType("Emby.Server.MediaEncoding.Api.Hls.BaseHlsService") ?? throw new Exception("No se encuentra BaseHlsService");
+    var method = service.Methods.SingleOrDefault(m => m.Name == "GetLivePlaylistText") ?? throw new Exception("No se encuentra GetLivePlaylistText");
+    if (method.IsStatic || method.Parameters.Count != 4 || method.Parameters[1].ParameterType.Name != "TranscodingJob" || method.Parameters[3].ParameterType.FullName != "System.Int32")
+        throw new Exception("Firma inesperada de GetLivePlaylistText");
+    var il = method.Body.Instructions;
+    bool Has(string text) => il.Any(i => i.OpCode == OpCodes.Ldstr && (string)i.Operand == text);
+    if (!Has("#EXT-X-PLAYLIST-TYPE:EVENT") || !Has("#EXT-X-MEDIA-SEQUENCE:0")) throw new Exception("GetLivePlaylistText no escribe EVENT / MEDIA-SEQUENCE:0");
+    // newobj StringBuilder; stloc.N
+    var newSb = il.FirstOrDefault(i => i.OpCode == OpCodes.Newobj && ((MethodReference)i.Operand).DeclaringType.FullName == "System.Text.StringBuilder")
+        ?? throw new Exception("No se encuentra el StringBuilder");
+    var sbVar = StoredLocal(method, newSb.Next) ?? throw new Exception("Patrón inesperado al guardar el StringBuilder");
+    // ... ToList<SegmentInfo>() queda en la pila hasta List<SegmentInfo>::GetEnumerator()
+    var toLists = il.Where(i => i.Operand is MethodReference m && m.Name == "ToList" && m.DeclaringType.FullName == "System.Linq.Enumerable").ToList();
+    var getEnums = il.Where(i => i.Operand is MethodReference m && m.Name == "GetEnumerator" && m.DeclaringType is GenericInstanceType g && g.ElementType.FullName == "System.Collections.Generic.List`1").ToList();
+    if (toLists.Count != 1 || getEnums.Count != 1) throw new Exception("Patrón inesperado de la lista de segmentos");
+    var toList = toLists[0];
+    var listType = (GenericInstanceType)((MethodReference)getEnums[0].Operand).DeclaringType;
+    if (listType.GenericArguments[0].FullName != "Emby.Server.MediaEncoding.Api.SegmentInfo") throw new Exception("La lista no es de SegmentInfo");
+    var getFileSystem = il.Select(i => i.Operand).OfType<MethodReference>().FirstOrDefault(m => m.Name == "get_FileSystem") ?? throw new Exception("No se encuentra FileSystem");
+    var getDirName = il.Select(i => i.Operand).OfType<MethodReference>().FirstOrDefault(m => m.Name == "GetDirectoryName" && m.DeclaringType.Name == "IFileSystem") ?? throw new Exception("No se encuentra GetDirectoryName");
+    var getPath = il.Select(i => i.Operand).OfType<MethodReference>().FirstOrDefault(m => m.Name == "get_Path" && m.DeclaringType.Name == "TranscodingJob") ?? throw new Exception("No se encuentra TranscodingJob.Path");
+    var getFileName = il.Select(i => i.Operand).OfType<MethodReference>().FirstOrDefault(m => m.Name == "GetFileName" && m.DeclaringType.FullName == "System.IO.Path") ?? throw new Exception("No se encuentra Path.GetFileName");
+    var appendLine = il.Select(i => i.Operand).OfType<MethodReference>().First(m => m.Name == "AppendLine");
+    var concat2 = il.Select(i => i.Operand).OfType<MethodReference>().FirstOrDefault(m => m.Name == "Concat" && m.Parameters.Count == 2 && m.DeclaringType.FullName == "System.String") ?? throw new Exception("No se encuentra String.Concat");
+    var refs = module.GetMemberReferences().OfType<MethodReference>().ToList();
+    var deleteFile = refs.Where(m => m.Name == "DeleteFile" && m.DeclaringType.FullName == "MediaBrowser.Model.IO.IFileSystem").OrderBy(m => m.Parameters.Count).FirstOrDefault()
+        ?? throw new Exception("No se encuentra IFileSystem.DeleteFile");
+    if (deleteFile.Parameters.Count > 1 && deleteFile.Parameters.Skip(1).Any(p => p.ParameterType.FullName != "System.Boolean")) throw new Exception("Firma inesperada de DeleteFile");
+    var segInfo = module.GetType("Emby.Server.MediaEncoding.Api.SegmentInfo") ?? throw new Exception("No se encuentra SegmentInfo");
+    var getFilename = segInfo.Properties.SingleOrDefault(p => p.Name == "Filename")?.GetMethod ?? throw new Exception("No se encuentra SegmentInfo.Filename");
+    var exceptionScope = module.TypeSystem.CoreLibrary; // System.Runtime
+    Console.WriteLine($"[live-hls-window] {method.FullName} (IL_{toList.Offset:x4})");
+
+    return () =>
+    {
+        var ts = module.TypeSystem;
+        var runtime = appendLine.DeclaringType.Scope;
+        var sbType = appendLine.DeclaringType;
+        var replace = new MethodReference("Replace", sbType, sbType) { HasThis = true };
+        replace.Parameters.Add(new ParameterDefinition(ts.String));
+        replace.Parameters.Add(new ParameterDefinition(ts.String));
+        var getEnv = Bcl(module, runtime, "System.Environment", "GetEnvironmentVariable", false, ts.String, ts.String);
+        var int32 = new TypeReference("System", "Int32", module, runtime, valueType: true);
+        var tryParse = new MethodReference("TryParse", ts.Boolean, int32) { HasThis = false };
+        tryParse.Parameters.Add(new ParameterDefinition(ts.String));
+        tryParse.Parameters.Add(new ParameterDefinition(new ByReferenceType(ts.Int32)));
+        var intToString = new MethodReference("ToString", ts.String, int32) { HasThis = true };
+        var combine = new MethodReference("Combine", ts.String, getFileName.DeclaringType) { HasThis = false };
+        combine.Parameters.Add(new ParameterDefinition(ts.String));
+        combine.Parameters.Add(new ParameterDefinition(ts.String));
+        var open = listType.ElementType;
+        if (open.GenericParameters.Count == 0) open.GenericParameters.Add(new GenericParameter("T", open));
+        var getCount = new MethodReference("get_Count", ts.Int32, listType) { HasThis = true };
+        var getItem = new MethodReference("get_Item", open.GenericParameters[0], listType) { HasThis = true };
+        getItem.Parameters.Add(new ParameterDefinition(ts.Int32));
+        var removeRange = new MethodReference("RemoveRange", ts.Void, listType) { HasThis = true };
+        removeRange.Parameters.Add(new ParameterDefinition(ts.Int32));
+        removeRange.Parameters.Add(new ParameterDefinition(ts.Int32));
+        var exception = new TypeReference("System", "Exception", module, exceptionScope, valueType: false);
+
+        // private static List<SegmentInfo> EmbyNoShare_LiveWindow(List<SegmentInfo> list, TranscodingJob job, int segmentLength, StringBuilder sb, BaseHlsService self)
+        // {
+        //     string s = Environment.GetEnvironmentVariable("EMBY_LIVE_HLS_WINDOW_MINUTES") ?? "30";
+        //     if (!int.TryParse(s, out int min) || min <= 0 || segmentLength <= 0) return list;
+        //     sb.Replace("#EXT-X-PLAYLIST-TYPE:EVENT", "");
+        //     int keep = min * 60 / segmentLength; if (keep < 10) keep = 10;
+        //     int k = list.Count - keep;
+        //     if (k <= 0) return list;
+        //     sb.Replace("#EXT-X-MEDIA-SEQUENCE:0", "#EXT-X-MEDIA-SEQUENCE:" + k.ToString());
+        //     string dir = self.FileSystem.GetDirectoryName(job.Path);
+        //     for (int i = Math.Max(0, k - 20); i < k; i++)
+        //         try { self.FileSystem.DeleteFile(Path.Combine(dir, list[i].Filename)); } catch (Exception) { }
+        //     list.RemoveRange(0, k);
+        //     return list;
+        // }
+        var helper = new MethodDefinition("EmbyNoShare_LiveWindow", MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig, listType);
+        helper.Parameters.Add(new ParameterDefinition("list", ParameterAttributes.None, listType));
+        helper.Parameters.Add(new ParameterDefinition("job", ParameterAttributes.None, method.Parameters[1].ParameterType));
+        helper.Parameters.Add(new ParameterDefinition("segmentLength", ParameterAttributes.None, ts.Int32));
+        helper.Parameters.Add(new ParameterDefinition("sb", ParameterAttributes.None, sbType));
+        helper.Parameters.Add(new ParameterDefinition("self", ParameterAttributes.None, service));
+        var s = new VariableDefinition(ts.String);
+        var min = new VariableDefinition(ts.Int32);
+        var keep = new VariableDefinition(ts.Int32);
+        var k = new VariableDefinition(ts.Int32);
+        var dir = new VariableDefinition(ts.String);
+        var i = new VariableDefinition(ts.Int32);
+        foreach (var v in new[] { s, min, keep, k, dir, i }) helper.Body.Variables.Add(v);
+        helper.Body.InitLocals = true;
+        var h = helper.Body.GetILProcessor();
+        var ret = h.Create(OpCodes.Ldarg_0);
+        var haveS = h.Create(OpCodes.Ldloc, s);
+        var keepOk = h.Create(OpCodes.Ldarg_0);
+        var iOk = h.Create(OpCodes.Nop);
+        var loopCond = h.Create(OpCodes.Ldloc, i);
+        var next = h.Create(OpCodes.Ldloc, i);
+        h.Append(h.Create(OpCodes.Ldstr, "EMBY_LIVE_HLS_WINDOW_MINUTES"));
+        h.Append(h.Create(OpCodes.Call, getEnv));
+        h.Append(h.Create(OpCodes.Stloc, s));
+        h.Append(h.Create(OpCodes.Ldloc, s));
+        h.Append(h.Create(OpCodes.Brtrue, haveS));
+        h.Append(h.Create(OpCodes.Ldstr, "30"));
+        h.Append(h.Create(OpCodes.Stloc, s));
+        h.Append(haveS);
+        h.Append(h.Create(OpCodes.Ldloca, min));
+        h.Append(h.Create(OpCodes.Call, tryParse));
+        h.Append(h.Create(OpCodes.Brfalse, ret));
+        h.Append(h.Create(OpCodes.Ldloc, min));
+        h.Append(h.Create(OpCodes.Ldc_I4_0));
+        h.Append(h.Create(OpCodes.Ble, ret));
+        h.Append(h.Create(OpCodes.Ldarg_2));
+        h.Append(h.Create(OpCodes.Ldc_I4_0));
+        h.Append(h.Create(OpCodes.Ble, ret));
+        h.Append(h.Create(OpCodes.Ldarg_3));
+        h.Append(h.Create(OpCodes.Ldstr, "#EXT-X-PLAYLIST-TYPE:EVENT"));
+        h.Append(h.Create(OpCodes.Ldstr, ""));
+        h.Append(h.Create(OpCodes.Callvirt, replace));
+        h.Append(h.Create(OpCodes.Pop));
+        h.Append(h.Create(OpCodes.Ldloc, min));
+        h.Append(h.Create(OpCodes.Ldc_I4, 60));
+        h.Append(h.Create(OpCodes.Mul));
+        h.Append(h.Create(OpCodes.Ldarg_2));
+        h.Append(h.Create(OpCodes.Div));
+        h.Append(h.Create(OpCodes.Stloc, keep));
+        h.Append(h.Create(OpCodes.Ldloc, keep));
+        h.Append(h.Create(OpCodes.Ldc_I4, 10));
+        h.Append(h.Create(OpCodes.Bge, keepOk));
+        h.Append(h.Create(OpCodes.Ldc_I4, 10));
+        h.Append(h.Create(OpCodes.Stloc, keep));
+        h.Append(keepOk);
+        h.Append(h.Create(OpCodes.Callvirt, getCount));
+        h.Append(h.Create(OpCodes.Ldloc, keep));
+        h.Append(h.Create(OpCodes.Sub));
+        h.Append(h.Create(OpCodes.Stloc, k));
+        h.Append(h.Create(OpCodes.Ldloc, k));
+        h.Append(h.Create(OpCodes.Ldc_I4_0));
+        h.Append(h.Create(OpCodes.Ble, ret));
+        h.Append(h.Create(OpCodes.Ldarg_3));
+        h.Append(h.Create(OpCodes.Ldstr, "#EXT-X-MEDIA-SEQUENCE:0"));
+        h.Append(h.Create(OpCodes.Ldstr, "#EXT-X-MEDIA-SEQUENCE:"));
+        h.Append(h.Create(OpCodes.Ldloca, k));
+        h.Append(h.Create(OpCodes.Call, intToString));
+        h.Append(h.Create(OpCodes.Call, concat2));
+        h.Append(h.Create(OpCodes.Callvirt, replace));
+        h.Append(h.Create(OpCodes.Pop));
+        h.Append(h.Create(OpCodes.Ldarg, helper.Parameters[4]));
+        h.Append(h.Create(OpCodes.Call, getFileSystem));
+        h.Append(h.Create(OpCodes.Ldarg_1));
+        h.Append(h.Create(OpCodes.Callvirt, getPath));
+        h.Append(h.Create(OpCodes.Callvirt, getDirName));
+        h.Append(h.Create(OpCodes.Stloc, dir));
+        h.Append(h.Create(OpCodes.Ldloc, k));
+        h.Append(h.Create(OpCodes.Ldc_I4, 20));
+        h.Append(h.Create(OpCodes.Sub));
+        h.Append(h.Create(OpCodes.Stloc, i));
+        h.Append(h.Create(OpCodes.Ldloc, i));
+        h.Append(h.Create(OpCodes.Ldc_I4_0));
+        h.Append(h.Create(OpCodes.Bge, loopCond));
+        h.Append(h.Create(OpCodes.Ldc_I4_0));
+        h.Append(h.Create(OpCodes.Stloc, i));
+        h.Append(h.Create(OpCodes.Br, loopCond));
+        // cuerpo: try { DeleteFile } catch (Exception) { }
+        var tryStart = h.Create(OpCodes.Ldarg, helper.Parameters[4]);
+        h.Append(tryStart);
+        h.Append(h.Create(OpCodes.Call, getFileSystem));
+        h.Append(h.Create(OpCodes.Ldloc, dir));
+        h.Append(h.Create(OpCodes.Ldarg_0));
+        h.Append(h.Create(OpCodes.Ldloc, i));
+        h.Append(h.Create(OpCodes.Callvirt, getItem));
+        h.Append(h.Create(OpCodes.Callvirt, getFilename));
+        h.Append(h.Create(OpCodes.Call, combine));
+        for (var a = 1; a < deleteFile.Parameters.Count; a++) h.Append(h.Create(OpCodes.Ldc_I4_0));
+        h.Append(h.Create(OpCodes.Callvirt, deleteFile));
+        h.Append(h.Create(OpCodes.Leave, next));
+        var catchStart = h.Create(OpCodes.Pop);
+        h.Append(catchStart);
+        h.Append(h.Create(OpCodes.Leave, next));
+        h.Append(next);
+        h.Append(h.Create(OpCodes.Ldc_I4_1));
+        h.Append(h.Create(OpCodes.Add));
+        h.Append(h.Create(OpCodes.Stloc, i));
+        h.Append(loopCond);
+        h.Append(h.Create(OpCodes.Ldloc, k));
+        h.Append(h.Create(OpCodes.Blt, tryStart));
+        h.Append(h.Create(OpCodes.Ldarg_0));
+        h.Append(h.Create(OpCodes.Ldc_I4_0));
+        h.Append(h.Create(OpCodes.Ldloc, k));
+        h.Append(h.Create(OpCodes.Callvirt, removeRange));
+        h.Append(ret);
+        h.Append(h.Create(OpCodes.Ret));
+        helper.Body.ExceptionHandlers.Add(new ExceptionHandler(ExceptionHandlerType.Catch)
+        {
+            TryStart = tryStart, TryEnd = catchStart,
+            HandlerStart = catchStart, HandlerEnd = next,
+            CatchType = exception,
+        });
+        helper.Body.OptimizeMacros();
+        service.Methods.Add(helper);
+
+        // ToList() -> EmbyNoShare_LiveWindow(ToList(), transcodingJob, segmentLength, sb, this)
+        method.Body.SimplifyMacros();
+        var p = method.Body.GetILProcessor();
+        var anchor = toList;
+        foreach (var ins in new[]
+        {
+            p.Create(OpCodes.Ldarg, method.Parameters[1]),
+            p.Create(OpCodes.Ldarg, method.Parameters[3]),
+            p.Create(OpCodes.Ldloc, sbVar),
+            p.Create(OpCodes.Ldarg_0),
+            p.Create(OpCodes.Call, helper),
+        })
+        {
+            p.InsertAfter(anchor, ins);
+            anchor = ins;
+        }
+        method.Body.OptimizeMacros();
+    };
+}
+
+static VariableDefinition? StoredLocal(MethodDefinition method, Instruction ins)
+{
+    var vars = method.Body.Variables;
+    if (ins.OpCode == OpCodes.Stloc_0) return vars[0];
+    if (ins.OpCode == OpCodes.Stloc_1) return vars[1];
+    if (ins.OpCode == OpCodes.Stloc_2) return vars[2];
+    if (ins.OpCode == OpCodes.Stloc_3) return vars[3];
+    return ins.Operand as VariableDefinition;
 }

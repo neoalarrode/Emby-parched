@@ -6,6 +6,9 @@
 #                                     de audio por idioma (alias esp..., audiodescripción al final, TV en directo)
 #   plugins Emby.XmlTV.dll y Emby.M3UTuner.dll (si están instalados) -> borrar las copias
 #                                     antiguas de la guía XMLTV en cada actualización
+#   Robustez de la TV en directo: aperturas sin bloqueo global (Implementations), cierre de streams
+#                                     huérfanos y reconexiones más tolerantes (LiveTV), ventana deslizante
+#                                     en el HLS convertido (MediaEncoding)
 # Solo aplica los parches que falten.
 # Uso: sudo ./aplicar-parche.sh [/opt/emby-server/system] [/var/lib/emby/plugins]
 set -e
