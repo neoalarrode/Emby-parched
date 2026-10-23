@@ -453,6 +453,7 @@ namespace EmbyNoShare.Runtime
                 {
                     Reflect.Set(state, "OutputVideoCodec", Reflect.Call(service, "GetOutputVideoCodec", state));
                     helpers.GetMethod("TryVideoStreamCopy").Invoke(null, new[] { state });
+                    LimitResolution(service, helpers, state, request);
                 }
                 var after = DescribeDecision(state);
                 Log(job, "Relanzar conversión: decisión " + (before == after ? "igual" : "nueva") + ": " + after);
@@ -463,14 +464,51 @@ namespace EmbyNoShare.Runtime
             }
         }
 
+        /// Como GetState: caudal de salida y, al convertir, resolución máxima según caudal y TranscodingMaxWidth
+        static void LimitResolution(object service, Type helpers, object state, object request)
+        {
+            var bitrate = helpers.GetMethod("GetVideoBitrateParamValue").Invoke(null, new[] { state });
+            var outputBitrate = Reflect.Get(bitrate, "Item1") as int?;
+            var scale = (double)Reflect.Get(bitrate, "Item2");
+            Reflect.Set(state, "OutputVideoBitrate", outputBitrate);
+            if (outputBitrate == null || string.Equals(Reflect.Get(state, "OutputVideoCodec") as string, "copy", StringComparison.OrdinalIgnoreCase)) return;
+            var maxWidth = Reflect.Get(request, "MaxWidth") as int?;
+            var maxHeight = Reflect.Get(request, "MaxHeight") as int?;
+            var limit = 0;
+            try { limit = (int)Reflect.Get(Reflect.Get(Reflect.Get(service, "Options"), "EncodingOptions"), "TranscodingMaxWidth"); } catch { }
+            if (limit > 0 && (!maxWidth.HasValue || limit < maxWidth.Value || (Reflect.Get(request, "IsResolutionCapped") is bool capped && capped && limit <= maxWidth.Value)))
+            {
+                maxWidth = limit;
+                maxHeight = null;
+                Reflect.Set(request, "IsResolutionCapped", true);
+                var cap = limit <= 720 ? 3000000 : limit <= 1280 ? 4000000 : limit <= 1920 ? 10000000 : int.MaxValue;
+                if (outputBitrate.Value > cap) { outputBitrate = cap; Reflect.Set(state, "OutputVideoBitrate", outputBitrate); }
+            }
+            var videoStream = Reflect.Get(state, "VideoStream");
+            var width = videoStream == null ? null : Reflect.Get(videoStream, "Width") as int?;
+            var height = videoStream == null ? null : Reflect.Get(videoStream, "Height") as int?;
+            if (Reflect.Get(state, "IsPhysicallyRotating") is bool rotating && rotating) { var w = width; width = height; height = w; }
+            var normalizer = service.GetType().Assembly.GetType("Emby.Server.MediaEncoding.Encoder.ResolutionNormalizer");
+            var options = normalizer.GetMethod("Normalize").Invoke(null, new object[]
+            {
+                videoStream == null ? null : Reflect.Get(videoStream, "BitRate") as int?, width, height,
+                Reflect.Get(state, "OutputVideoCodec") as string, outputBitrate.Value, scale, maxWidth, maxHeight,
+            });
+            helpers.GetMethod("ApplyCodecResolutionLimits").Invoke(null, new[] { state, width, height, options });
+            Reflect.Set(request, "MaxWidth", Reflect.Get(options, "MaxWidth"));
+            Reflect.Set(request, "MaxHeight", Reflect.Get(options, "MaxHeight"));
+        }
+
         static string DescribeDecision(object state)
         {
             try
             {
                 var v = Reflect.Get(state, "VideoStream");
-                return string.Format(CultureInfo.InvariantCulture, "vídeo {0} {1}x{2}{3} -> {4}",
+                var request = Reflect.Get(state, "BaseRequest");
+                return string.Format(CultureInfo.InvariantCulture, "vídeo {0} {1}x{2}{3} -> {4} (máx. {5}x{6}, {7} bps)",
                     v == null ? "-" : Reflect.Get(v, "Codec"), v == null ? 0 : Reflect.Get(v, "Width"), v == null ? 0 : Reflect.Get(v, "Height"),
-                    v != null && Reflect.Get(v, "IsInterlaced") is bool i && i ? "i" : "p", Reflect.Get(state, "OutputVideoCodec"));
+                    v != null && Reflect.Get(v, "IsInterlaced") is bool i && i ? "i" : "p", Reflect.Get(state, "OutputVideoCodec"),
+                    Reflect.Get(request, "MaxWidth"), Reflect.Get(request, "MaxHeight"), Reflect.Get(state, "OutputVideoBitrate"));
             }
             catch { return "?"; }
         }

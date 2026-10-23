@@ -37,7 +37,9 @@ namespace EmbyNoShare.Runtime
     {
         const long Clock = 90000;
         const long Wrap = 1L << 33;
-        const int SegmentSeconds = 3;
+        const int SegmentSeconds = 1;           // trozos del origen: se cortan en cada fotograma clave a partir de 1 s
+        const double BridgeIdle = 1.5;          // con el origen ya en marcha, s sin datos para que entre la intro
+        const int DeclaredVideoBitrate = 8000000, DeclaredAudioBitrate = 192000;   // mientras va la intro (ver Run)
         const int IntroSegmentSeconds = 1;      // la intro va en trozos cortos: el origen entra en cuanto tiene el suyo
         const int EncodedAhead = 6;             // trozos de intro codificados por delante como máximo
         const double LowLead = 1.0;             // s de margen publicado por debajo de los cuales entra la intro
@@ -243,6 +245,7 @@ namespace EmbyNoShare.Runtime
                 PublishIntro(st, NextCached(st));
                 PublishIntro(st, NextCached(st));
                 Probe(st, LastPublishedPath(st), ct);
+                DeclareBitrate(st);
                 Log(source, "Puente: canal listo con la intro en " + Ms(started) + " ms; el origen se conecta aparte");
                 StartPublisher(st);
             }
@@ -592,7 +595,14 @@ namespace EmbyNoShare.Runtime
                 var segments = new List<object>();
                 object segment;
                 while ((segment = TakeEncoded(enc, 60000)) != null) segments.Add(segment);
-                if (segments.Count == 0) throw new Exception("Puente: no se pudo preparar la intro: " + enc.Error.Trim());
+                if (segments.Count < 2) throw new Exception("Puente: no se pudo preparar la intro: " + enc.Error.Trim());
+                // cada trozo con el audio que suena antes del fotograma del siguiente; el último (de más) solo presta
+                for (var i = 0; i + 1 < segments.Count; i++)
+                {
+                    var current = (object[])segments[i];
+                    current[0] = WithBorrowedAudio(st, (byte[])current[0], (byte[])((object[])segments[i + 1])[0]);
+                }
+                segments.RemoveAt(segments.Count - 1);
                 var tmp = dir + ".tmp";
                 try { if (Directory.Exists(tmp)) Directory.Delete(tmp, true); } catch { }
                 Directory.CreateDirectory(tmp);
@@ -611,6 +621,25 @@ namespace EmbyNoShare.Runtime
         }
 
         static readonly object IntroLock = new object();
+
+        /// Caudal de la intro (barras, negro) es mínimo y Emby decidiría con él (p. ej. copiar a un cliente limitado): se
+        /// declara uno de canal HD normal hasta que llega el origen y Emby lo analiza
+        static void DeclareBitrate(State st)
+        {
+            try
+            {
+                if (!(Reflect.Get(st.MediaSource, "MediaStreams") is System.Collections.IEnumerable streams)) return;
+                var total = 0;
+                foreach (var s in streams)
+                {
+                    var type = Reflect.Get(s, "Type")?.ToString();
+                    if (type == "Video") { Reflect.Set(s, "BitRate", (int?)DeclaredVideoBitrate); total += DeclaredVideoBitrate; }
+                    else if (type == "Audio") { Reflect.Set(s, "BitRate", (int?)DeclaredAudioBitrate); total += DeclaredAudioBitrate; }
+                }
+                if (total > 0) Reflect.Set(st.MediaSource, "Bitrate", (int?)total);
+            }
+            catch (Exception e) { Log(st.Source, "Puente: no se pudo declarar el caudal: " + e.Message); }
+        }
 
         static object[] ReadIntroCache(string dir)
         {
@@ -950,9 +979,11 @@ namespace EmbyNoShare.Runtime
             if (key != null && key != st.ActivityKey) { st.ActivityKey = key; st.LastActivity = DateTime.UtcNow; }
             if (st.PassThrough) { CheckStall(st); return; }
 
-            // puente: más intro si a los lectores se les va a acabar lo publicado
+            // puente: más intro si a los lectores se les va a acabar lo publicado y, con el origen ya en marcha, si además
+            // lleva un rato sin mandar nada (si manda, su trozo está al llegar)
             var lead = Lead(st);
-            if (st.OutStarted && lead < LowLead)
+            var sourceRunning = st.RunKind == 2 && (DateTime.UtcNow - st.LastActivity).TotalSeconds < BridgeIdle;
+            if (st.OutStarted && lead < LowLead && !sourceRunning)
             {
                 if (!st.Bridging) Log(st.Source, "Puente: el origen no llega a tiempo (margen " + lead.ToString("0.0", CultureInfo.InvariantCulture) + " s), entra la intro");
                 st.Bridging = true;
