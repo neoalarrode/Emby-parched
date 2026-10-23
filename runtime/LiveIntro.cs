@@ -13,6 +13,8 @@
 //   - Puente: si a los lectores se les va a acabar lo publicado (apertura, corte, retraso del origen), entra la intro
 //     codificada por el ffmpeg de Emby exactamente en el formato actual del canal (códec, parámetros, PID, PAT/PMT), con
 //     el tiempo seguido. En cuanto hay trozos del origen, siguen ellos.
+//   - Orígenes a ráfagas: se mide su ritmo (hueco normal entre ráfagas) y los umbrales de intro, reconexión y vuelta
+//     al directo se adaptan a él, para no tomar un hueco normal por un corte.
 //   - Cambio de formato a mitad de directo (resolución, entrelazado, códec, pistas): se detecta en cada trozo, Emby
 //     vuelve a analizar el canal, la intro se regenera en el formato nuevo, el trozo va con discontinuidad (HLS directo)
 //     y PMT con versión nueva (MPEG-TS), y las conversiones de Emby se relanzan con una decisión nueva (LiveRestart).
@@ -86,6 +88,11 @@ namespace EmbyNoShare.Runtime
             public int GenCount, GenFailures;
             public bool GenStarting;
             public DateTime NextGenRestart, LastActivity, GenStartedAt;
+            // ritmo del origen: huecos entre ráfagas de datos (s) de los últimos minutos
+            public DateTime? LastData;
+            public readonly List<double> GapValues = new List<double>();
+            public readonly List<DateTime> GapTimes = new List<DateTime>();
+            public double BurstGap;
             public readonly object GenLock = new object();
             public string ActivityKey;
 
@@ -169,7 +176,7 @@ namespace EmbyNoShare.Runtime
                 }
                 if (started) st.Held.Add(file);
                 else st.Done.Add(file);
-                st.LastActivity = DateTime.UtcNow;
+                NoteData(st);
                 return true;
             }
         }
@@ -459,6 +466,7 @@ namespace EmbyNoShare.Runtime
                 st.Held.Clear();
                 st.Done.Clear();
                 st.LastActivity = DateTime.UtcNow;
+                st.LastData = null;
                 st.ActivityKey = null;
             }
             if (old != null) Task.Delay(15000).ContinueWith(_ => { try { Directory.Delete(old.Dir, true); } catch { } });
@@ -976,13 +984,13 @@ namespace EmbyNoShare.Runtime
                     var last = Reflect.Get(st.Held[st.Held.Count - 1], "Path") as string;
                     key = st.Held.Count.ToString(CultureInfo.InvariantCulture) + "|" + last + "|" + FileSize(last).ToString(CultureInfo.InvariantCulture);
                 }
-            if (key != null && key != st.ActivityKey) { st.ActivityKey = key; st.LastActivity = DateTime.UtcNow; }
+            if (key != null && key != st.ActivityKey) lock (st) { st.ActivityKey = key; NoteData(st); }
             if (st.PassThrough) { CheckStall(st); return; }
 
             // puente: más intro si a los lectores se les va a acabar lo publicado y, con el origen ya en marcha, si además
             // lleva un rato sin mandar nada (si manda, su trozo está al llegar)
             var lead = Lead(st);
-            var sourceRunning = st.RunKind == 2 && (DateTime.UtcNow - st.LastActivity).TotalSeconds < BridgeIdle;
+            var sourceRunning = st.RunKind == 2 && (DateTime.UtcNow - st.LastActivity).TotalSeconds < Math.Max(BridgeIdle, 1.5 * st.BurstGap);
             if (st.OutStarted && lead < LowLead && !sourceRunning)
             {
                 if (!st.Bridging) Log(st.Source, "Puente: el origen no llega a tiempo (margen " + lead.ToString("0.0", CultureInfo.InvariantCulture) + " s), entra la intro");
@@ -1006,11 +1014,37 @@ namespace EmbyNoShare.Runtime
             }
         }
 
+        /// Llegan datos del origen (con st bloqueado): anota el hueco desde los anteriores, para conocer su ritmo. Un
+        /// origen que manda a ráfagas (HLS, relevos con buffer) tiene huecos normales de varios segundos que no son cortes.
+        static void NoteData(State st)
+        {
+            var now = DateTime.UtcNow;
+            if (st.LastData != null)
+            {
+                var gap = (now - st.LastData.Value).TotalSeconds;
+                if (gap >= 0.5)
+                {
+                    st.GapValues.Add(gap);
+                    st.GapTimes.Add(now);
+                }
+                while (st.GapTimes.Count > 0 && (now - st.GapTimes[0]).TotalMinutes > 2) { st.GapTimes.RemoveAt(0); st.GapValues.RemoveAt(0); }
+                // el hueco "normal": el mayor reciente, salvo uno suelto (un corte de verdad no debe cambiar los umbrales)
+                var sorted = new List<double>(st.GapValues);
+                sorted.Sort();
+                var typical = sorted.Count == 0 ? 0 : sorted.Count < 3 ? sorted[0] : sorted[sorted.Count - 2];
+                if (Math.Abs(typical - st.BurstGap) > 0.5 && (typical >= 1 || st.BurstGap >= 1))
+                    Log(st.Source, "Puente: el origen manda a ráfagas, hueco normal " + typical.ToString("0.0", CultureInfo.InvariantCulture) + " s");
+                st.BurstGap = typical;
+            }
+            st.LastData = now;
+            st.LastActivity = now;
+        }
+
         static void CheckStall(State st)
         {
             if (st.GenStarting || DateTime.UtcNow < st.NextGenRestart) return;
             var idle = (DateTime.UtcNow - st.LastActivity).TotalSeconds;
-            if (idle < Stall) return;
+            if (idle < Math.Max(Stall, 3 * st.BurstGap + 2)) return;
             Log(st.Source, "Puente: " + ((int)idle).ToString(CultureInfo.InvariantCulture) + " s sin datos del origen, se abre otra conexión");
             RestartGen(st, 0);
         }
@@ -1086,7 +1120,7 @@ namespace EmbyNoShare.Runtime
                 if (firstDts == null) return;
 
                 // volver al directo si se ha acumulado demasiado margen
-                if (!formatChanged && st.OutStarted && Lead(st) > MaxLead)
+                if (!formatChanged && st.OutStarted && Lead(st) > Math.Max(MaxLead, 3 * st.BurstGap + 10))
                 {
                     if (!st.Dropping) Log(st.Source, "Puente: margen de " + Lead(st).ToString("0.0", CultureInfo.InvariantCulture) + " s, se descartan trozos para volver al directo");
                     st.Dropping = true;
