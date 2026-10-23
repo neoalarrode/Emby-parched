@@ -91,6 +91,7 @@ namespace EmbyNoShare.Runtime
             public double TargetFps = 25;        // imágenes por segundo del formato fijo: 25, o más si el origen trae más
             public string Hw = "";               // codificador por hardware si hay que convertir el vídeo: "", "qsv" o "vaapi"
             public bool VideoTranscode;          // el vídeo del origen no es H.264: se convierte (si lo es, se copia)
+            public string AudioPlan;             // por pista de audio del origen: 'c' se copia (AAC-LC estéreo 48 kHz), 't' se convierte
             public string CurrentNormalize;      // con qué arrancó el ffmpeg del origen en marcha
             public bool Detected;                // ya se sabe si entra directo o por ffmpeg
             public Gen Gen;
@@ -434,7 +435,7 @@ namespace EmbyNoShare.Runtime
             if (hw == "qsv") args.Append(" -init_hw_device vaapi=va:").Append(device).Append(" -init_hw_device qsv=qs@va -filter_hw_device qs");
             else if (hw == "vaapi") args.Append(" -init_hw_device vaapi=va:").Append(device).Append(" -filter_hw_device va");
             args.Append(" -i ").Append(Quote(st.RemuxUrl));
-            if (st.Normalize) { args.Append(' ').Append(NormalizeArguments(st.VideoTranscode, st.TargetFps, hw)); st.CurrentNormalize = NormalizeKey(st); }
+            if (st.Normalize) { args.Append(' ').Append(NormalizeArguments(st.VideoTranscode, st.TargetFps, hw, st.AudioPlan)); st.CurrentNormalize = NormalizeKey(st); }
             else args.Append(' ').Append(st.RemuxMap ?? "-map 0:v? -map 0:a?").Append(" -c copy -f mpegts pipe:1");
             if (st.Normalize) args.Replace("-loglevel error", "-loglevel info -nostats");
             var info = new ProcessStartInfo(Tool("ffmpeg"), args.ToString())
@@ -447,7 +448,8 @@ namespace EmbyNoShare.Runtime
             };
             HardwareEnvironment(info);
             var process = Process.Start(info);
-            process.ErrorDataReceived += (sender, e) => { if (!string.IsNullOrEmpty(e.Data)) SourceLog(st, hw, e.Data); };
+            var dump = new InputDump();
+            process.ErrorDataReceived += (sender, e) => { if (!string.IsNullOrEmpty(e.Data)) SourceLog(st, hw, dump, e.Data); };
             process.BeginErrorReadLine();
             var gen = st.Gen;
             if (gen != null) lock (gen.Remux) gen.Remux.Add(process);
@@ -477,8 +479,9 @@ namespace EmbyNoShare.Runtime
 
         /// Normalización ligera: vídeo H.264 copiado tal cual; si es de otro códec, convertido a H.264 a su resolución (sin
         /// agrandar), desentrelazado, decodificando la CPU (aguanta cualquier cambio) y codificando la gráfica si Emby la
-        /// tiene activada. Audio siempre AAC estéreo 48 kHz (barato). Pistas en orden y PID fijos, PMT 0x1000.
-        static string NormalizeArguments(bool transcode, double fps, string hw)
+        /// tiene activada. Audio: la pista que ya es AAC-LC estéreo 48 kHz (como la intro) se copia; las demás (AC-3, MP2…)
+        /// se convierten a eso. Sin plan aún (primer arranque) se copia todo. Pistas en orden y PID fijos, PMT 0x1000.
+        static string NormalizeArguments(bool transcode, double fps, string hw, string audioPlan)
         {
             var b = new StringBuilder("-map 0:v:0 -map 0:a? ");
             if (!transcode) b.Append("-c:v copy");
@@ -507,13 +510,24 @@ namespace EmbyNoShare.Runtime
                 }
                 b.Append("-vf ").Append(Quote(filter)).Append(' ').Append(video);
             }
-            b.Append(" -af aresample=async=1:first_pts=0 -c:a aac -ar 48000 -ac 2 -b:a 192k");
+            b.Append(" -c:a copy");
+            for (var i = 0; audioPlan != null && i < audioPlan.Length; i++)
+                if (audioPlan[i] == 't')
+                    b.AppendFormat(CultureInfo.InvariantCulture, " -c:a:{0} aac -ar:a:{0} 48000 -ac:a:{0} 2 -b:a:{0} 192k -filter:a:{0} aresample=async=1:first_pts=0", i);
             for (var i = 0; i < 9; i++) b.Append(" -streamid ").Append(i.ToString(CultureInfo.InvariantCulture)).Append(':').Append((0x100 + i).ToString(CultureInfo.InvariantCulture));
             b.Append(" -mpegts_pmt_start_pid 4096 -muxdelay 0 -muxpreload 0 -f mpegts pipe:1");
             return b.ToString();
         }
 
-        static string NormalizeKey(State st) => st.VideoTranscode ? "t" + st.TargetFps.ToString(CultureInfo.InvariantCulture) + st.Hw : "c";
+        static string NormalizeKey(State st) => (st.VideoTranscode ? "t" + st.TargetFps.ToString(CultureInfo.InvariantCulture) + st.Hw : "c")
+                                                + "|" + (st.AudioPlan ?? "").TrimEnd('c');   // sin plan = copiar todo
+
+        /// Lo que la ffmpeg del origen cuenta de su entrada (entre "Input #0" y "Output #0")
+        sealed class InputDump
+        {
+            public bool InInput, Done;
+            public readonly StringBuilder Audio = new StringBuilder();
+        }
 
         static string FpsRational(double fps)
         {
@@ -527,14 +541,33 @@ namespace EmbyNoShare.Runtime
 
         /// Mensajes del ffmpeg del origen: cadencia real (si trae más de la del formato fijo, se sube), sin vídeo
         /// (radio: sin normalizar) y fallos de la gráfica (se pasa a CPU)
-        static void SourceLog(State st, string hw, string line)
+        static void SourceLog(State st, string hw, InputDump dump, string line)
         {
             try
             {
-                if (st.Normalize && line.IndexOf("Stream #0:", StringComparison.Ordinal) >= 0 && line.IndexOf("Video:", StringComparison.Ordinal) > 0
-                    && line.IndexOf("Input", StringComparison.Ordinal) < 0 && System.Text.RegularExpressions.Regex.IsMatch(line, @"Stream #0:\d+\["))
+                if (st.Normalize && !dump.Done)
                 {
-                    // solo la línea de la entrada (lleva [PID]); la de salida es la nuestra
+                    if (line.StartsWith("Input #0", StringComparison.Ordinal)) { dump.InInput = true; return; }
+                    if (dump.InInput && (line.StartsWith("Output #0", StringComparison.Ordinal) || line.StartsWith("Stream mapping", StringComparison.Ordinal)))
+                    {
+                        // entrada completa: con lo visto, si la ffmpeg en marcha no hace lo que toca, otra
+                        dump.Done = true;
+                        var plan = dump.Audio.ToString();
+                        if (plan != (st.AudioPlan ?? new string('c', plan.Length)) && plan.IndexOf('t') >= 0)
+                            Log(st.Source, "Puente: audio del origen: " + plan.Length + " pista(s), se convierte(n) a AAC estéreo las que no lo son (" + plan + ")");
+                        st.AudioPlan = plan;
+                        if (st.CurrentNormalize != NormalizeKey(st)) RestartGen(st, 0);
+                        return;
+                    }
+                }
+                if (st.Normalize && dump.InInput && !dump.Done && line.IndexOf("Stream #0:", StringComparison.Ordinal) >= 0 && line.IndexOf("Audio:", StringComparison.Ordinal) > 0)
+                {
+                    var copy = System.Text.RegularExpressions.Regex.IsMatch(line, @"Audio: aac \(LC\)") && line.Contains(" 48000 Hz") && line.Contains(" stereo");
+                    dump.Audio.Append(copy ? 'c' : 't');
+                    return;
+                }
+                if (st.Normalize && dump.InInput && !dump.Done && line.IndexOf("Stream #0:", StringComparison.Ordinal) >= 0 && line.IndexOf("Video:", StringComparison.Ordinal) > 0)
+                {
                     var codec = System.Text.RegularExpressions.Regex.Match(line, @"Video: (\w+)").Groups[1].Value;
                     if (!st.VideoTranscode && codec.Length > 0 && codec != "h264")
                     {
@@ -560,9 +593,7 @@ namespace EmbyNoShare.Runtime
                             st.TargetFps = motion;
                         }
                     }
-                    // la ffmpeg en marcha arrancó copiando (o con otra cadencia): otra con lo decidido
-                    if (st.CurrentNormalize != NormalizeKey(st)) RestartGen(st, 0);
-                    return;
+                    return;   // se decide al acabar la entrada
                 }
                 var lower = line.ToLowerInvariant();
                 if (st.Normalize && lower.Contains("0:v:0") && lower.Contains("matches no streams"))
