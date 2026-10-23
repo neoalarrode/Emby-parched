@@ -99,6 +99,7 @@ namespace EmbyNoShare.Runtime
             // trozos del origen retenidos (generación actual) y los ya terminados
             public readonly List<object> Held = new List<object>();
             public readonly HashSet<object> Done = new HashSet<object>();
+            public readonly HashSet<object> Partial = new HashSet<object>();     // publicados a medias al cortarse el origen
             public bool Replaying, PassThrough;
             public int NextSeq;
 
@@ -231,8 +232,11 @@ namespace EmbyNoShare.Runtime
                 Intro = intro,
                 OriginalUrl = Reflect.Get(ms, "Path") as string,
                 OriginalProtocol = Reflect.Get(ms, "Protocol"),
-                Main = (CancellationTokenSource)Reflect.Get(source, "LiveStreamCancellationTokenSource"),
             };
+            // el canal no depende de la petición que lo abrió (Emby enlaza su token con el de la apertura): solo se para
+            // cuando Emby lo cierra (LiveStream.Close cancela este)
+            st.Main = new CancellationTokenSource();
+            Reflect.Set(source, "LiveStreamCancellationTokenSource", st.Main);
             st.Token = st.Main.Token;
             var started = DateTime.UtcNow;
             try
@@ -971,6 +975,13 @@ namespace EmbyNoShare.Runtime
                         st.Done.Remove(file);
                     }
                 if (file == null) break;
+                if (st.Partial.Remove(file))
+                {
+                    // ya se publicó lo que tenía al cortarse el origen; lo que llegó después empieza a mitad de GOP
+                    TryDelete(Reflect.Get(file, "Path") as string);
+                    st.RunKind = 0;
+                    continue;
+                }
                 if (st.PassThrough) PublishRaw(st, file);
                 else PublishSource(st, file);
                 st.GenFailures = 0;
@@ -991,6 +1002,11 @@ namespace EmbyNoShare.Runtime
             // lleva un rato sin mandar nada (si manda, su trozo está al llegar)
             var lead = Lead(st);
             var sourceRunning = st.RunKind == 2 && (DateTime.UtcNow - st.LastActivity).TotalSeconds < Math.Max(BridgeIdle, 1.5 * st.BurstGap);
+            if (st.OutStarted && lead < LowLead && !sourceRunning)
+            {
+                // lo que ya llegó del trozo a medias va antes que la intro
+                if (!st.Bridging && st.RunKind == 2 && PublishPartial(st)) lead = Lead(st);
+            }
             if (st.OutStarted && lead < LowLead && !sourceRunning)
             {
                 if (!st.Bridging) Log(st.Source, "Puente: el origen no llega a tiempo (margen " + lead.ToString("0.0", CultureInfo.InvariantCulture) + " s), entra la intro");
@@ -1040,11 +1056,57 @@ namespace EmbyNoShare.Runtime
             st.LastActivity = now;
         }
 
+        /// Origen parado a mitad de un trozo: se publica lo que tiene hasta el último fotograma completo (el resto se
+        /// descarta cuando el trozo se cierre)
+        static bool PublishPartial(State st)
+        {
+            object file;
+            lock (st) file = st.Held.Count > 0 ? st.Held[st.Held.Count - 1] : null;
+            if (file == null || st.Done.Contains(file) || st.Partial.Contains(file)) return false;
+            var raw = ReadShared(Reflect.Get(file, "Path") as string, 0, int.MaxValue);
+            raw = Truncate(raw, raw.Length - raw.Length % 188);
+            // hasta el inicio del último PES de vídeo (puede estar incompleto) y sin PES de audio a medias
+            var cut = -1;
+            for (var p = raw.Length - 188; p >= 0; p -= 188)
+                if (raw[p] == 0x47 && PidOf(raw, p) == st.VideoPid && (raw[p + 1] & 0x40) != 0) { cut = p; break; }
+            if (cut <= 188 * 16) return false;
+            var lastAudioStart = new Dictionary<int, int>();
+            for (var p = 0; p < cut; p += 188)
+            {
+                var pid = PidOf(raw, p);
+                if (raw[p] == 0x47 && pid != st.VideoPid && st.MediaPids.Contains(pid) && (raw[p + 1] & 0x40) != 0) lastAudioStart[pid] = p;
+            }
+            var output = new MemoryStream(cut);
+            for (var p = 0; p < cut; p += 188)
+            {
+                var pid = PidOf(raw, p);
+                if (lastAudioStart.TryGetValue(pid, out var start) && p >= start) continue;
+                output.Write(raw, p, 188);
+            }
+            var path = Path.Combine(st.BaseDir, "partial" + st.NextSeq.ToString(CultureInfo.InvariantCulture) + ".ts");
+            File.WriteAllBytes(path, output.ToArray());
+            var info = Activator.CreateInstance(st.InfoType);
+            Reflect.Set(info, "Path", path);
+            lock (st) st.Partial.Add(file);
+            Log(st.Source, "Puente: el origen se para a mitad de un trozo; se publica lo recibido antes de la intro");
+            PublishSource(st, info);
+            return true;
+        }
+
+        static byte[] Truncate(byte[] data, int length)
+        {
+            if (length >= data.Length) return data;
+            var copy = new byte[length];
+            Buffer.BlockCopy(data, 0, copy, 0, length);
+            return copy;
+        }
+
         static void CheckStall(State st)
         {
             if (st.GenStarting || DateTime.UtcNow < st.NextGenRestart) return;
             var idle = (DateTime.UtcNow - st.LastActivity).TotalSeconds;
-            if (idle < Math.Max(Stall, 3 * st.BurstGap + 2)) return;
+            // tras un intento fallido, el siguiente a los 3 s
+            if (idle < (st.GenFailures > 0 ? 3 : Math.Max(Stall, 3 * st.BurstGap + 2))) return;
             Log(st.Source, "Puente: " + ((int)idle).ToString(CultureInfo.InvariantCulture) + " s sin datos del origen, se abre otra conexión");
             RestartGen(st, 0);
         }

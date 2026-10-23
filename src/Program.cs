@@ -1482,6 +1482,10 @@ static Action? PrepareLiveHlsRestart(ModuleDefinition module)
         || playlist.Parameters[1].ParameterType.Name != "TranscodingJob" || command.Parameters[1].ParameterType.Name != "StreamState"
         || exited.Parameters[1].ParameterType.Name != "TranscodingJob" || exited.Parameters[2].ParameterType.Name != "StreamState")
         throw new Exception("Firmas inesperadas en la conversión HLS");
+    var waitMove = GetMoveNext(module.GetType("Emby.Server.MediaEncoding.Api.Hls.BaseHlsService"), "WaitForMinimumSegmentCount");
+    var waitCalls = waitMove.Body.Instructions.Where(i => (i.OpCode == OpCodes.Callvirt || i.OpCode == OpCodes.Call)
+        && i.Operand is MethodReference m && m.Name == "GetCompletedSegments" && m.DeclaringType.Name == "TranscodingJob").ToList();
+    if (waitCalls.Count == 0) throw new Exception("No se encuentra GetCompletedSegments en WaitForMinimumSegmentCount");
     Console.WriteLine($"[live-hls-restart] {exited.FullName}");
     Console.WriteLine($"[live-hls-restart] {startNumber.FullName}, {playlist.FullName}, {command.FullName}");
 
@@ -1492,6 +1496,21 @@ static Action? PrepareLiveHlsRestart(ModuleDefinition module)
         var number = Injector.Method(rt, "StartNumber", 2);
         var text = Injector.Method(rt, "Playlist", 2);
         var adjust = Injector.Method(rt, "AdjustCommand", 2);
+        var current = Injector.Method(rt, "CurrentJob", 3);
+        var completedHook = Injector.Method(rt, "CompletedSegments", 1);
+
+        // GetLivePlaylistText: transcodingJob = (TranscodingJob)LiveRestart.CurrentJob(this, transcodingJob, state);
+        var pl = playlist.Body.GetILProcessor();
+        Prologue(playlist, pl.Create(OpCodes.Ldarg_0), pl.Create(OpCodes.Ldarg_2), pl.Create(OpCodes.Ldarg_1), pl.Create(OpCodes.Call, current),
+            pl.Create(OpCodes.Castclass, playlist.Parameters[1].ParameterType), pl.Create(OpCodes.Starg_S, playlist.Parameters[1]));
+        // WaitForMinimumSegmentCount: job.GetCompletedSegments() -> LiveRestart.CompletedSegments(job)
+        foreach (var call in waitCalls)
+        {
+            var returnType = ((MethodReference)call.Operand).ReturnType;
+            call.OpCode = OpCodes.Call;
+            call.Operand = completedHook;
+            waitMove.Body.GetILProcessor().InsertAfter(call, Instruction.Create(OpCodes.Castclass, waitMove.Module.ImportReference(returnType)));
+        }
 
         // OnFfMpegProcessExited: if (LiveRestart.OnExited(this, runner, job, state)) return;
         var p = exited.Body.GetILProcessor();

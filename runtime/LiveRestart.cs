@@ -36,6 +36,8 @@ namespace EmbyNoShare.Runtime
         // conversiones de TV en directo en curso (StreamState) y las que deben decidir de nuevo (formato del canal cambiado)
         static readonly List<object> Tracked = new List<object>();
         static readonly HashSet<object> Redecisions = new HashSet<object>();
+        // conversión relanzada -> la que la sustituye
+        static readonly Dictionary<object, object> Replaced = new Dictionary<object, object>();
         static bool handlerRegistered;
 
         sealed class Pending
@@ -142,6 +144,11 @@ namespace EmbyNoShare.Runtime
                 task.GetAwaiter().GetResult();
                 var newJob = Reflect.Get(task, "Result");
                 if (completed.Length > 0) Reflect.Call(newJob, "AddCompletedSegments", completed);
+                lock (Sync)
+                {
+                    Replaced[job] = newJob;
+                    if (Replaced.Count > 256) Replaced.Clear();
+                }
                 Reflect.Set(newJob, "StartingSegmentIndex", (int?)next);
                 RemoveJob(Reflect.Get(service, "EncodingManager"), job);
                 Log(job, "Relanzar conversión: relanzada desde el segmento " + next.ToString(CultureInfo.InvariantCulture)
@@ -374,6 +381,41 @@ namespace EmbyNoShare.Runtime
             {
                 return text;
             }
+        }
+
+        static object Latest(object job)
+        {
+            lock (Sync)
+            {
+                for (var i = 0; i < 32 && job != null && Replaced.TryGetValue(job, out var next); i++) job = next;
+                return job;
+            }
+        }
+
+        /// BaseHlsService.WaitForMinimumSegmentCount: los segmentos de la conversión vigente (si la que se esperaba se
+        /// relanzó, la espera seguiría para siempre mirando la vieja)
+        public static object CompletedSegments(object job) => Reflect.Call(Latest(job), "GetCompletedSegments");
+
+        /// BaseHlsService.GetLivePlaylistText: la conversión vigente; si la petición llega sin ella (otra petición
+        /// simultánea la arrancó, o se está relanzando), la de su sesión, esperando un poco a que aparezca
+        public static object CurrentJob(object service, object job, object state)
+        {
+            try
+            {
+                job = Latest(job);
+                if (job != null && !(Reflect.Get(job, "HasExited") is bool exited && exited)) return job;
+                var session = Reflect.Get(Reflect.Get(state, "BaseRequest"), "PlaySessionId") as string;
+                var manager = Reflect.Get(service, "EncodingManager");
+                if (string.IsNullOrEmpty(session) || manager == null) return job;
+                for (var i = 0; i < 100; i++)
+                {
+                    var current = Reflect.Call(manager, "GetTranscodingJob", session);
+                    if (current != null) return Latest(current);
+                    Thread.Sleep(100);
+                }
+            }
+            catch { }
+            return job;
         }
 
         /// Anota la conversión de TV en directo y registra el aviso de cambio de formato para Emby.LiveTV (LiveIntro)
