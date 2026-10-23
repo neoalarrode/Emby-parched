@@ -252,6 +252,7 @@ namespace EmbyNoShare.Runtime
                 st.Cached = IntroCache(st);
                 ApplyTables(st, ParseTables((byte[])((object[])st.Cached[0])[0]));
                 lock (Sync) States[source] = st;
+                AppDomain.CurrentDomain.SetData("EmbyNoShare.Bridge." + st.Uid, true);
                 st.Token.Register(() => Cleanup(st));
                 RestartGen(st, 0);
 
@@ -273,6 +274,8 @@ namespace EmbyNoShare.Runtime
         static void Cleanup(State st)
         {
             lock (Sync) States.Remove(st.Source);
+            AppDomain.CurrentDomain.SetData("EmbyNoShare.Bridge." + st.Uid, null);
+            AppDomain.CurrentDomain.SetData("EmbyNoShare.FormatSeq." + st.Uid, null);
             StopEncoder(st);
             var gen = st.Gen;
             if (gen != null) StopGen(gen);

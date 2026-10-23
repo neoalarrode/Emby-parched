@@ -36,6 +36,7 @@ namespace EmbyNoShare.Runtime
         // conversiones de TV en directo en curso (StreamState) y las que deben decidir de nuevo (formato del canal cambiado)
         static readonly List<object> Tracked = new List<object>();
         static readonly HashSet<object> Redecisions = new HashSet<object>();
+        static readonly HashSet<object> Deferred = new HashSet<object>();
         // conversión relanzada -> la que la sustituye
         static readonly Dictionary<object, object> Replaced = new Dictionary<object, object>();
         static bool handlerRegistered;
@@ -138,7 +139,10 @@ namespace EmbyNoShare.Runtime
                 int? formatSeq = null;
                 var liveStream = Reflect.Get(state, "LiveStream");
                 var uniqueId = liveStream == null ? null : Reflect.Get(liveStream, "UniqueId") as string;
-                if (formatChange && uniqueId != null && AppDomain.CurrentDomain.GetData("EmbyNoShare.FormatSeq." + uniqueId) is int seq) formatSeq = seq;
+                bool deferredChange;
+                lock (Sync) deferredChange = Deferred.Remove(state);
+                // tras sacar la intro, la conversión pudo leer ya algo del canal: se sigue donde se quedó
+                if (formatChange && !deferredChange && uniqueId != null && AppDomain.CurrentDomain.GetData("EmbyNoShare.FormatSeq." + uniqueId) is int seq) formatSeq = seq;
                 if (formatSeq != null) AppDomain.CurrentDomain.SetData(LiveInput.Key + uniqueId, formatSeq.Value);
                 else if (next > 0) Position(service, runner, job, state, end, pending);
                 lock (Sync)
@@ -459,6 +463,16 @@ namespace EmbyNoShare.Runtime
         static void Track(object state)
         {
             if (state == null || Reflect.Get(state, "LiveStream") == null) return;
+            // canal con puente (LiveIntro): empieza por la intro, basta un segmento para dar la lista al cliente
+            try
+            {
+                var uid = Reflect.Get(Reflect.Get(state, "LiveStream"), "UniqueId") as string;
+                var request = Reflect.Get(state, "Request");
+                if (uid != null && AppDomain.CurrentDomain.GetData("EmbyNoShare.Bridge." + uid) is bool bridged && bridged
+                    && request != null && Reflect.Get(request, "MinSegments") == null)
+                    Reflect.Set(request, "MinSegments", (int?)1);
+            }
+            catch { }
             lock (Sync)
             {
                 if (!Tracked.Contains(state)) Tracked.Add(state);
@@ -470,6 +484,18 @@ namespace EmbyNoShare.Runtime
                     handlerRegistered = true;
                 }
             }
+        }
+
+        static int MediaSegments(object job)
+        {
+            try
+            {
+                var count = 0;
+                foreach (var item in (Array)Reflect.Call(Latest(job), "GetCompletedSegments"))
+                    if (Reflect.Get(Reflect.Get(item, "Value"), "SegmentType")?.ToString() == "Media") count++;
+                return count;
+            }
+            catch { return 0; }
         }
 
         static bool Exited(object state)
@@ -497,9 +523,26 @@ namespace EmbyNoShare.Runtime
                     var job = Reflect.Get(state, "TranscodingJob");
                     var runner = Reflect.Get(job, "EncodingRunner");
                     if (runner == null) continue;
-                    lock (Sync) Redecisions.Add(state);
-                    Log(job, "Relanzar conversión: el formato del canal cambia, se cierra para decidir de nuevo");
-                    Task.Run(() => { try { ((Task)Reflect.Call(runner, "End", 0)).Wait(10000); } catch { } });
+                    Task.Run(() =>
+                    {
+                        try
+                        {
+                            // si aún no ha sacado ningún segmento (está con la intro de la apertura), primero que la saque: el
+                            // cliente empieza viendo la intro y no espera a tres segmentos del canal
+                            var deferred = false;
+                            var until = DateTime.UtcNow.AddSeconds(15);
+                            while (MediaSegments(job) == 0 && !Exited(state) && DateTime.UtcNow < until) { deferred = true; Thread.Sleep(200); }
+                            if (Exited(state)) return;
+                            lock (Sync)
+                            {
+                                Redecisions.Add(state);
+                                if (deferred) Deferred.Add(state); else Deferred.Remove(state);
+                            }
+                            Log(job, "Relanzar conversión: el formato del canal cambia, se cierra para decidir de nuevo" + (deferred ? " (tras la intro)" : ""));
+                            ((Task)Reflect.Call(runner, "End", 0)).Wait(10000);
+                        }
+                        catch { }
+                    });
                 }
                 catch (Exception e) { Log(state, "Relanzar conversión: aviso de formato fallido: " + e.Message); }
             }
