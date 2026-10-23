@@ -168,10 +168,28 @@ namespace EmbyNoShare.Runtime
             var cut = target - 0.05;
             if (string.Equals(Reflect.Get(state, "OutputVideoCodec") as string, "copy", StringComparison.OrdinalIgnoreCase))
             {
-                var at = files.IndexOf(Reflect.Get(best, "Path") as string);
+                // El fotograma suele ser el primero del trozo siguiente, que puede estar aún escribiéndose (GetSegments
+                // solo da los terminados): se miran también los dos siguientes por su nombre y se espera un poco
+                var bestPath = Reflect.Get(best, "Path") as string;
+                var candidates = new List<string>();
+                var at = files.IndexOf(bestPath);
+                for (var i = Math.Max(0, at); i < files.Count && i <= at + 2; i++) candidates.Add(files[i]);
+                if (Reflect.Get(best, "SequenceNumber") is int seq && bestPath != null)
+                    for (var n = 1; n <= 2; n++)
+                    {
+                        var next = Path.Combine(Path.GetDirectoryName(bestPath) ?? "", (seq + n).ToString("0000000", CultureInfo.InvariantCulture) + Path.GetExtension(bestPath));
+                        if (!candidates.Contains(next)) candidates.Add(next);
+                    }
                 double? dts = null;
-                for (var i = Math.Max(0, at); i < files.Count && i <= at + 2 && dts == null; i++) dts = KeyframeDts(files[i], target);
-                if (dts != null) cut = dts.Value - 0.001;
+                var deadline = DateTime.UtcNow.AddSeconds(4);
+                while (dts == null)
+                {
+                    foreach (var file in candidates) { dts = KeyframeDts(file, target); if (dts != null) break; }
+                    if (dts != null || DateTime.UtcNow > deadline) break;
+                    Thread.Sleep(100);
+                }
+                // si no aparece, mejor repetir medio segundo que perder un GOP entero
+                cut = dts != null ? dts.Value - 0.001 : target - 0.5;
             }
             var uniqueId = Reflect.Get(liveStream, "UniqueId") as string;
             if (string.IsNullOrEmpty(uniqueId)) return;
