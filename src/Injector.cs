@@ -23,6 +23,23 @@ static class Injector
         return runtimeModule = ModuleDefinition.ReadModule(ms);
     }
 
+    /// Huella del código de apoyo incrustado (identifica la compilación del parcheador)
+    public static string Hash()
+    {
+        // la DLL de runtime lleva un MVID nuevo en cada compilación: la huella va sobre el IL de sus métodos
+        var module = Runtime();
+        using var sha = System.Security.Cryptography.SHA256.Create();
+        var text = new System.Text.StringBuilder();
+        foreach (var t in module.GetTypes().OrderBy(t => t.FullName))
+            foreach (var m in t.Methods.OrderBy(m => m.FullName))
+            {
+                text.Append(m.FullName).Append('\n');
+                if (m.HasBody) foreach (var i in m.Body.Instructions) text.Append(i.ToString()).Append('\n');
+            }
+        var hash = sha.ComputeHash(System.Text.Encoding.UTF8.GetBytes(text.ToString()));
+        return Convert.ToHexString(hash, 0, 6).ToLowerInvariant();
+    }
+
     /// Devuelve el tipo EmbyNoShare.Runtime.<name> dentro de target, copiándolo si aún no está.
     public static TypeDefinition Ensure(ModuleDefinition target, string name)
     {

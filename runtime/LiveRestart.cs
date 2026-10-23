@@ -33,6 +33,10 @@ namespace EmbyNoShare.Runtime
         // lista HLS (ruta del .m3u8 de la conversión) -> segmentos con discontinuidad delante
         static readonly Dictionary<string, List<int>> Discontinuities = new Dictionary<string, List<int>>(StringComparer.OrdinalIgnoreCase);
         static readonly Dictionary<string, List<DateTime>> Restarts = new Dictionary<string, List<DateTime>>(StringComparer.OrdinalIgnoreCase);
+        // conversiones de TV en directo en curso (StreamState) y las que deben decidir de nuevo (formato del canal cambiado)
+        static readonly List<object> Tracked = new List<object>();
+        static readonly HashSet<object> Redecisions = new HashSet<object>();
+        static bool handlerRegistered;
 
         sealed class Pending
         {
@@ -56,14 +60,17 @@ namespace EmbyNoShare.Runtime
                 // Emby quita la conversión de su lista antes de pararla a propósito: si sigue, ha muerto sola
                 if (manager == null || playSession == null || !ReferenceEquals(Reflect.Call(manager, "GetTranscodingJob", playSession), job)) return false;
                 var exitCode = Reflect.Get(runner, "LastExitCode") as int?;
-                if (exitCode == 0) return false;   // terminó normalmente (fin del directo)
+                bool redecide;
+                lock (Sync) redecide = Redecisions.Contains(state);
+                if (exitCode == 0 && !redecide) return false;   // terminó normalmente (fin del directo)
                 var liveStreamId = Reflect.Get(job, "LiveStreamId") as string;
                 var sources = Reflect.Get(service, "MediaSourceManager");
                 if (string.IsNullOrEmpty(liveStreamId) || sources == null || Reflect.Call(sources, "GetLiveStreamInfo", liveStreamId) == null) return false;
                 var path = Reflect.Get(job, "Path") as string;
-                if (path == null || !AllowRestart(path)) { Log(job, "Relanzar conversión: demasiados relanzamientos seguidos, se deja parada " + path); return false; }
+                if (path == null || (!redecide && !AllowRestart(path))) { Log(job, "Relanzar conversión: demasiados relanzamientos seguidos, se deja parada " + path); return false; }
 
-                Log(job, "Relanzar conversión: ffmpeg terminó con código " + (exitCode?.ToString(CultureInfo.InvariantCulture) ?? "?") + ", se relanza " + path);
+                Log(job, redecide ? "Relanzar conversión: el formato del canal ha cambiado, se relanza con una decisión nueva " + path
+                                  : "Relanzar conversión: ffmpeg terminó con código " + (exitCode?.ToString(CultureInfo.InvariantCulture) ?? "?") + ", se relanza " + path);
                 Reflect.Call(job, "OnExited");
                 try { Reflect.Call(runner, "Dispose"); } catch { }
                 ThreadPool.QueueUserWorkItem(Restart, new[] { service, runner, job, state });
@@ -119,6 +126,8 @@ namespace EmbyNoShare.Runtime
                 }
                 Reflect.Set(state, "Id", Guid.NewGuid());
                 try { Reflect.Call(Reflect.Get(state, "TranscodeLog"), "Clear"); } catch { }
+                lock (Sync) Redecisions.Remove(state);
+                Redecide(service, job, state);
 
                 var task = (Task)Reflect.Call(service, "StartFfMpeg", state, path, CancellationToken.None, false);
                 task.GetAwaiter().GetResult();
@@ -174,10 +183,13 @@ namespace EmbyNoShare.Runtime
                 var candidates = new List<string>();
                 var at = files.IndexOf(bestPath);
                 for (var i = Math.Max(0, at); i < files.Count && i <= at + 2; i++) candidates.Add(files[i]);
-                if (Reflect.Get(best, "SequenceNumber") is int seq && bestPath != null)
+                var named = bestPath == null ? null : Regex.Match(Path.GetFileNameWithoutExtension(bestPath), @"^(\D*)(\d+)$");
+                if (Reflect.Get(best, "SequenceNumber") is int seq && named != null && named.Success)
                     for (var n = 1; n <= 2; n++)
                     {
-                        var next = Path.Combine(Path.GetDirectoryName(bestPath) ?? "", (seq + n).ToString("0000000", CultureInfo.InvariantCulture) + Path.GetExtension(bestPath));
+                        var digits = new string('0', named.Groups[2].Value.Length);
+                        var next = Path.Combine(Path.GetDirectoryName(bestPath) ?? "",
+                            named.Groups[1].Value + (seq + n).ToString(digits, CultureInfo.InvariantCulture) + Path.GetExtension(bestPath));
                         if (!candidates.Contains(next)) candidates.Add(next);
                     }
                 double? dts = null;
@@ -291,6 +303,7 @@ namespace EmbyNoShare.Runtime
         {
             try
             {
+                Track(state);
                 Pending pending;
                 lock (Sync) pending = state != null && Pendings.TryGetValue(state, out var p) ? (Pending)p : null;
                 if (pending?.Seek == null || command == null) return command;
@@ -351,6 +364,105 @@ namespace EmbyNoShare.Runtime
             {
                 return text;
             }
+        }
+
+        /// Anota la conversión de TV en directo y registra el aviso de cambio de formato para Emby.LiveTV (LiveIntro)
+        static void Track(object state)
+        {
+            if (state == null || Reflect.Get(state, "LiveStream") == null) return;
+            lock (Sync)
+            {
+                if (!Tracked.Contains(state)) Tracked.Add(state);
+                if (Tracked.Count > 64)
+                    Tracked.RemoveAll(s => !Pendings.ContainsKey(s) && !Redecisions.Contains(s) && Exited(s));
+                if (!handlerRegistered)
+                {
+                    AppDomain.CurrentDomain.SetData("EmbyNoShare.LiveFormatChanged", new Action<string>(FormatChanged));
+                    handlerRegistered = true;
+                }
+            }
+        }
+
+        static bool Exited(object state)
+        {
+            try
+            {
+                var job = Reflect.Get(state, "TranscodingJob");
+                return job == null || Reflect.Get(job, "HasExited") is bool b && b;
+            }
+            catch { return true; }
+        }
+
+        /// El formato del canal ha cambiado: sus conversiones terminan (q) y OnExited las relanza decidiendo de nuevo
+        public static void FormatChanged(string uniqueId)
+        {
+            var states = new List<object>();
+            lock (Sync) states.AddRange(Tracked);
+            foreach (var state in states)
+            {
+                try
+                {
+                    var liveStream = Reflect.Get(state, "LiveStream");
+                    if (liveStream == null || !string.Equals(Reflect.Get(liveStream, "UniqueId") as string, uniqueId, StringComparison.Ordinal)) continue;
+                    if (Exited(state)) continue;
+                    var job = Reflect.Get(state, "TranscodingJob");
+                    var runner = Reflect.Get(job, "EncodingRunner");
+                    if (runner == null) continue;
+                    lock (Sync) Redecisions.Add(state);
+                    Log(job, "Relanzar conversión: el formato del canal cambia, se cierra para decidir de nuevo");
+                    Task.Run(() => { try { ((Task)Reflect.Call(runner, "End", 0)).Wait(10000); } catch { } });
+                }
+                catch (Exception e) { Log(state, "Relanzar conversión: aviso de formato fallido: " + e.Message); }
+            }
+        }
+
+        /// Vuelve a decidir con el formato actual del canal, como GetState: pistas, códec de salida (copia o conversión),
+        /// contenedor de segmentos; desentrelazado y decodificador salen del nuevo formato al construir el comando
+        static void Redecide(object service, object job, object state)
+        {
+            try
+            {
+                var helpers = service.GetType().Assembly.GetType("Emby.Server.MediaEncoding.Encoder.EncodingHelpers");
+                var mediaSource = Reflect.Get(state, "MediaSource");
+                if (helpers == null || mediaSource == null) return;
+                var before = DescribeDecision(state);
+                // pistas pedidas que ya no existen en el formato nuevo: las elige Emby
+                var request = Reflect.Get(state, "BaseRequest");
+                var streams = Reflect.Get(mediaSource, "MediaStreams") as System.Collections.IEnumerable;
+                foreach (var (property, kind) in new[] { ("AudioStreamIndex", "Audio"), ("VideoStreamIndex", "Video") })
+                {
+                    if (!(Reflect.Get(request, property) is int wanted)) continue;
+                    var found = false;
+                    if (streams != null)
+                        foreach (var s in streams)
+                            if (Reflect.Get(s, "Index") is int i && i == wanted && Reflect.Get(s, "Type")?.ToString() == kind) found = true;
+                    if (!found) Reflect.Set(request, property, null);
+                }
+                helpers.GetMethod("AttachMediaSourceInfo").Invoke(null, new[] { state, mediaSource, Reflect.Get(state, "RequestedUrl"), Reflect.Get(service, "FfmpegManager") });
+                if (Reflect.Get(state, "IsVideoRequest") is bool video && video)
+                {
+                    Reflect.Set(state, "OutputVideoCodec", Reflect.Call(service, "GetOutputVideoCodec", state));
+                    helpers.GetMethod("TryVideoStreamCopy").Invoke(null, new[] { state });
+                }
+                var after = DescribeDecision(state);
+                Log(job, "Relanzar conversión: decisión " + (before == after ? "igual" : "nueva") + ": " + after);
+            }
+            catch (Exception e)
+            {
+                Log(job, "Relanzar conversión: no se pudo decidir de nuevo, se mantiene la anterior: " + e.Message);
+            }
+        }
+
+        static string DescribeDecision(object state)
+        {
+            try
+            {
+                var v = Reflect.Get(state, "VideoStream");
+                return string.Format(CultureInfo.InvariantCulture, "vídeo {0} {1}x{2}{3} -> {4}",
+                    v == null ? "-" : Reflect.Get(v, "Codec"), v == null ? 0 : Reflect.Get(v, "Width"), v == null ? 0 : Reflect.Get(v, "Height"),
+                    v != null && Reflect.Get(v, "IsInterlaced") is bool i && i ? "i" : "p", Reflect.Get(state, "OutputVideoCodec"));
+            }
+            catch { return "?"; }
         }
 
         static void Log(object job, string message) => Reflect.Log(job, message);

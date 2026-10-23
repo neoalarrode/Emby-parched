@@ -9,7 +9,8 @@
 #   Robustez de la TV en directo: aperturas sin bloqueo global (Implementations), cierre de streams
 #                                     huérfanos y reconexiones más tolerantes (LiveTV), ventana deslizante
 #                                     en el HLS convertido (MediaEncoding)
-# Solo aplica los parches que falten.
+# Solo aplica los parches que falten; si una DLL lleva el código de apoyo de otra versión del parcheador, la vuelve
+# a parchear entera desde su copia original guardada (misma versión de Emby).
 # Uso: sudo ./aplicar-parche.sh [/opt/emby-server/system] [/var/lib/emby/plugins]
 set -e
 SYS="${1:-/opt/emby-server/system}"
@@ -30,13 +31,38 @@ for F in "$PLUGINS/Emby.XmlTV.dll" "$PLUGINS/Emby.M3UTuner.dll"; do
   [ -f "$F" ] && FILES="$FILES $F"
 done
 
-# Comprueba todas las DLL antes de tocar nada
+# Copia original (sin parchear) de la misma versión de Emby que la DLL actual, de las que guarda este script
+original_of() {
+  cur=$("$BIN" "$1" --info | sed -n 's/.*version=\([^ ]*\).*/\1/p')
+  for B in $(ls -tr "$1".orig-* 2>/dev/null); do
+    info=$("$BIN" "$B" --info 2>/dev/null) || continue
+    case "$info" in
+      *"version=$cur "*"patched=0"*) echo "$B"; return 0 ;;
+    esac
+  done
+  return 1
+}
+
+# Comprueba todas las DLL antes de tocar nada. Si una lleva el código de apoyo de otra versión del parcheador,
+# se vuelve a parchear entera desde su copia original.
 PENDING=""
+FRESH=""
+TMP=$(mktemp -d)
+trap 'rm -rf "$TMP"' EXIT
 for F in $FILES; do
   rc=0; "$BIN" "$F" --check || rc=$?
   case "$rc" in
     0) PENDING="$PENDING $F" ;;
     3) ;;
+    4)
+      O=$(original_of "$F") || { echo "$F necesita partir de la DLL original y no hay copia sin parchear de esta versión de Emby; no se ha tocado nada."; exit 1; }
+      cp -p "$(dirname "$F")"/*.dll "$TMP/" 2>/dev/null || true
+      cp -p "$O" "$TMP/$(basename "$F")"
+      rc2=0; "$BIN" "$TMP/$(basename "$F")" --check || rc2=$?
+      [ "$rc2" = 0 ] || { echo "El patrón no coincide en la original de $F; no se ha tocado nada."; exit 1; }
+      PENDING="$PENDING $F"; FRESH="$FRESH $F=$O"
+      echo "$F se vuelve a parchear desde $O"
+      ;;
     *) echo "El patrón no coincide en $F con esta versión; no se ha tocado nada."; exit 1 ;;
   esac
 done
@@ -45,6 +71,7 @@ done
 TS=$(date +%Y%m%d%H%M%S)
 for F in $PENDING; do cp -p "$F" "$F.orig-$TS"; done
 systemctl stop emby-server 2>/dev/null || true
+for P in $FRESH; do cp -p "${P#*=}" "${P%%=*}"; done
 for F in $PENDING; do "$BIN" "$F"; done
 systemctl start emby-server 2>/dev/null || true
 

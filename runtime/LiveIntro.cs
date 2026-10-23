@@ -1,24 +1,30 @@
-// Emby.LiveTV: abrir un canal MPEG-TS sin esperar a llenar el buffer, con una intro codificada al vuelo exactamente en
-// el formato del canal.
+// Emby.LiveTV: puente entre el origen de un canal y sus lectores, para que el directo se adapte a lo que llegue y se
+// recupere solo, sin cortes para el cliente.
 //
-// Hoy SharedHttpPipelineSource.OpenInternal conecta con el proveedor, espera dos trozos de 3 s del buffer y analiza el
-// canal antes de responder al cliente. Con EMBY_LIVE_INTRO (ruta de un vídeo o imagen) ocurre esto:
-//   1. Se conecta igual y el buffer empieza a escribirse, pero los trozos del canal se retienen (Hold): los lectores
-//      todavía no los ven.
-//   2. En cuanto llega la tabla de pistas y el primer fotograma clave, se mira el formato real con ffprobe (códec,
-//      resolución, entrelazado, fps, audio, PID) y Emby analiza ese trozo como siempre: responde con el formato real.
-//   3. El ffmpeg de Emby codifica la intro en ese mismo formato: mismo códec y parámetros, mismos PID, y la tabla de
-//      pistas (PAT/PMT) del canal copiada byte a byte, así que las pistas tienen los mismos índices y descriptores.
-//   4. La intro va al buffer como trozos normales, con marcas de tiempo justo antes de las del canal, al ritmo al que
-//      llega el canal. Al empezar un trozo del canal posterior al final de la intro, se recorta la intro en ese
-//      instante y se publican los trozos del canal: el tiempo sigue continuo y el formato es el mismo, así que ni el
-//      cliente (directo MPEG-TS o HLS) ni el ffmpeg de Emby cambian nada.
-// Si algo no encaja (fuente HLS, formato sin codificador, la intro no arranca) se sigue sin intro como Emby.
+// Hoy SharedHttpPipelineSource conecta con el proveedor, espera dos trozos de 3 s, analiza el canal y deja que los
+// lectores (ffmpeg de Emby, reproducción directa MPEG-TS, HLS directo) lean el buffer tal cual se escribe. Si el origen
+// tarda, se corta, salta de reloj o cambia de formato, el cliente se queda en negro o se cae. Con este puente:
+//   - Ingesta: cada conexión con el origen es una "generación" con su propio token y carpeta. Si el origen deja de
+//     mandar datos o el procesador de Emby falla, se abre otra sin cerrar el canal. Los orígenes HLS (o mp4, mkv...)
+//     entran por el ffmpeg de Emby convertidos a MPEG-TS sin recodificar.
+//   - Los trozos del origen se retienen hasta estar completos y se publican reescritos sobre una línea de tiempo propia
+//     y continua (PTS/DTS/PCR, contadores de continuidad, PAT/PMT con versión), así que reconexiones, saltos de reloj o
+//     cambios de PID no llegan a los lectores.
+//   - Puente: si a los lectores se les va a acabar lo publicado (apertura, corte, retraso del origen), entra la intro
+//     codificada por el ffmpeg de Emby exactamente en el formato actual del canal (códec, parámetros, PID, PAT/PMT), con
+//     el tiempo seguido. En cuanto hay trozos del origen, siguen ellos.
+//   - Cambio de formato a mitad de directo (resolución, entrelazado, códec, pistas): se detecta en cada trozo, Emby
+//     vuelve a analizar el canal, la intro se regenera en el formato nuevo, el trozo va con discontinuidad (HLS directo)
+//     y PMT con versión nueva (MPEG-TS), y las conversiones de Emby se relanzan con una decisión nueva (LiveRestart).
+//   - Si al abrir el origen no da nada en 8 s, el canal arranca con la intro en un formato estándar y se adapta al real
+//     cuando llegue.
+// EMBY_LIVE_BRIDGE=0 lo desactiva. EMBY_LIVE_INTRO: vídeo o imagen de la intro (si no, negro con silencio).
 using System;
 using System.Collections.Generic;
 using System.Diagnostics;
 using System.Globalization;
 using System.IO;
+using System.Net;
 using System.Text;
 using System.Text.Json;
 using System.Threading;
@@ -31,88 +37,172 @@ namespace EmbyNoShare.Runtime
         const long Clock = 90000;
         const long Wrap = 1L << 33;
         const int SegmentSeconds = 3;
-        const int EncodedAhead = 4;          // trozos de intro codificados por delante como máximo
+        const int EncodedAhead = 3;             // trozos de intro codificados por delante como máximo
+        const double FormatWait = 8;            // s esperando el formato del origen al abrir
+        const double LowLead = 1.0;             // s de margen publicado por debajo de los cuales entra la intro
+        const double MaxLead = 25;              // s de margen por encima de los cuales se descartan trozos (volver al directo)
+        const double Stall = 10;                // s sin datos del origen para abrir otra conexión
+        const long OutStart = 10 * Clock;       // primer DTS de la línea de tiempo publicada
 
         static readonly object Sync = new object();
         static readonly Dictionary<object, object> States = new Dictionary<object, object>();
         static readonly HashSet<object> Bypass = new HashSet<object>();
 
+        sealed class Gen
+        {
+            public int Id;
+            public CancellationTokenSource Cts;
+            public string Dir;
+            public readonly List<Process> Remux = new List<Process>();
+        }
+
+        sealed class Encoder
+        {
+            public Process Process;
+            public readonly Queue<object> Queue = new Queue<object>();
+            public bool Done;
+            public string Error = "";
+        }
+
         sealed class State
         {
             public object Source, MediaSource;
-            public string Uid, Dir;
+            public string Uid, BaseDir, BasePattern, Intro;
             public Type InfoType;
+            public CancellationTokenSource Main;
             public CancellationToken Token;
-            // trozos del canal empezados (en orden) y los ya terminados, retenidos hasta el cambio
+
+            // origen
+            public string OriginalUrl, RemuxUrl, RemuxMap;
+            public object OriginalProtocol;
+            public bool Remuxed;                 // entra por el ffmpeg de Emby (HLS u otro contenedor)
+            public Gen Gen;
+            public int GenCount, GenFailures;
+            public bool GenStarting;
+            public DateTime NextGenRestart, LastActivity, GenStartedAt;
+            public Process FirstRemux;
+            public readonly object GenLock = new object();
+            public string ActivityKey;
+
+            // trozos del origen retenidos (generación actual) y los ya terminados
             public readonly List<object> Held = new List<object>();
             public readonly HashSet<object> Done = new HashSet<object>();
-            public bool Switched, Replaying;
-            public int NextSeq, LastSeq = -1;
+            public bool Replaying, PassThrough;
+            public int NextSeq;
 
-            // formato del canal
+            // formato actual
+            public JsonElement[] Format;
+            public bool DefaultFormat;
+            public string Signature, Material;
             public byte[][] Pat, Pmt;
-            public int PmtPid, PcrPid, VideoPid;
+            public int PmtPid, PcrPid, VideoPid = -1;
             public readonly HashSet<int> MediaPids = new HashSet<int>();
+            public long FrameDur = Clock / 25;
+            public string PatBody, PmtBody;
+            public int PatVersion = -1, PmtVersion = -1;
             public readonly Dictionary<int, int> Counters = new Dictionary<int, int>();
+            // audio publicado: siguiente PTS esperado por pista (para no solapar al empezar un tramo)
+            public readonly Dictionary<int, long> AudioNext = new Dictionary<int, long>();
+            public readonly Dictionary<int, long> AudioDelta = new Dictionary<int, long>();
 
-            // intro codificada (trozos {byte[] datos, long inicio, long duración} con marcas de ffmpeg)
-            public Process Encoder;
-            public readonly Queue<object> Encoded = new Queue<object>();
-            public bool EncoderDone;
-            public string EncoderError = "";
+            // intro
+            public Encoder Enc;
             public int IntroPmtPid;
-            public long Shift;
+            public DateTime NextEncoderStart;
+            public bool Bridging;
+
+            // línea de tiempo publicada
+            public bool OutStarted;
+            public long OutNextDts, P0;
+            public DateTime W0;
+            public int RunKind;                  // 0 ninguno, 1 intro, 2 origen
+            public long RunOffset;
+            public long? RunRawNext;
+            public bool Dropping;
+            public int ProbeCount;
         }
 
         // ---------------------------------------------------------------------------------------------------------
         // Ganchos
 
-        /// SharedHttpPipelineSource.OpenInternal: la apertura con intro, o null para seguir con la de Emby
+        /// SharedHttpPipelineSource.OpenInternal: la apertura con puente, o null para seguir con la de Emby
         public static Task Open(object source, CancellationToken cancellationToken)
         {
             try
             {
-                var intro = Environment.GetEnvironmentVariable("EMBY_LIVE_INTRO");
-                if (string.IsNullOrEmpty(intro) || !File.Exists(intro)) return null;
+                if (Environment.GetEnvironmentVariable("EMBY_LIVE_BRIDGE") == "0") return null;
                 lock (Sync) if (Bypass.Contains(source)) return null;
                 var protocol = Reflect.Get(Reflect.Get(source, "MediaSource"), "Protocol")?.ToString();
                 if (protocol != "Http" && protocol != "File") return null;
+                var intro = Environment.GetEnvironmentVariable("EMBY_LIVE_INTRO");
+                if (string.IsNullOrEmpty(intro) || !File.Exists(intro)) intro = null;
                 return Task.Run(() => Run(source, intro, cancellationToken));
             }
             catch (Exception e)
             {
-                Log(source, "Intro: no se usa: " + e.Message);
+                Log(source, "Puente: no se usa: " + e.Message);
                 return null;
             }
         }
 
-        /// SharedHttpPipelineSource.OnSegmentStarted / OnSegmentCompleted: true si el trozo del canal se retiene
+        /// SharedHttpPipelineSource.OnSegmentStarted / OnSegmentCompleted: los trozos del origen se retienen (true)
         public static bool Hold(object source, object file, bool started)
         {
-            State st;
-            lock (Sync)
-            {
-                if (!States.TryGetValue(source, out var o)) return false;
-                st = (State)o;
-            }
+            var st = Find(source);
+            if (st == null) return false;
             lock (st)
             {
                 if (st.Replaying) return false;
-                if (!st.Switched)
+                var path = Reflect.Get(file, "Path") as string ?? "";
+                var gen = st.Gen;
+                if (gen == null || !path.StartsWith(gen.Dir + Path.DirectorySeparatorChar, StringComparison.Ordinal))
                 {
-                    if (started) st.Held.Add(file);
-                    else st.Done.Add(file);
+                    // de una conexión anterior
+                    if (!started) TryDelete(path);
                     return true;
                 }
-                // ya publicado: la numeración sigue a la de la intro
-                if (started)
-                {
-                    if (!(Reflect.Get(file, "SequenceNumber") is int seq) || seq != st.LastSeq + 1)
-                        Reflect.Set(file, "SequenceNumber", st.LastSeq + 1);
-                    st.LastSeq++;
-                }
-                return false;
+                if (started) st.Held.Add(file);
+                else st.Done.Add(file);
+                st.LastActivity = DateTime.UtcNow;
+                return true;
             }
+        }
+
+        /// SharedHttpPipelineSource.OpenStream: para orígenes que entran por ffmpeg, su salida MPEG-TS (o null)
+        public static object OpenStream(object source, object context, object mediaSource, string url, CancellationToken ct)
+        {
+            var st = Find(source);
+            if (st == null || !st.Remuxed) return null;
+            var resultType = OpenStreamResultType(source);
+            try
+            {
+                var result = Remux(st, context, ct);
+                return typeof(Task).GetMethod("FromResult").MakeGenericMethod(resultType).Invoke(null, new[] { result });
+            }
+            catch (Exception e)
+            {
+                return typeof(Task).GetMethod("FromException", 1, new[] { typeof(Exception) }).MakeGenericMethod(resultType).Invoke(null, new object[] { e });
+            }
+        }
+
+        /// Fallo del procesador de Emby (antes cerraba todo el directo): con puente, otra conexión
+        public static void PipelineFailed(object source)
+        {
+            var st = Find(source);
+            if (st == null)
+            {
+                ((CancellationTokenSource)Reflect.Get(source, "LiveStreamCancellationTokenSource")).Cancel();
+                return;
+            }
+            // al parar una conexión vieja también puede fallar su procesador: solo cuenta el de la actual
+            if ((DateTime.UtcNow - st.GenStartedAt).TotalSeconds < 5) return;
+            Log(source, "Puente: el procesador del origen ha fallado, se abre otra conexión");
+            RestartGen(st, 0);
+        }
+
+        static State Find(object source)
+        {
+            lock (Sync) return States.TryGetValue(source, out var o) ? (State)o : null;
         }
 
         // ---------------------------------------------------------------------------------------------------------
@@ -121,96 +211,82 @@ namespace EmbyNoShare.Runtime
         static void Run(object source, string intro, CancellationToken ct)
         {
             var ms = Reflect.Get(source, "MediaSource");
-            var url = Reflect.Get(ms, "Path") as string;
-            var protocol = Reflect.Get(ms, "Protocol");
-            var opening = (Task)Reflect.Call(source, "OpenStream", null, ms, url, protocol, ct, 0);
-            opening.GetAwaiter().GetResult();
-            var result = Reflect.Get(opening, "Result");
-            var response = Reflect.Get(result, "ResponseInfo");
-            var context = Reflect.Get(result, "ConectionContext");
-            if (!(Reflect.Call(source, "IsBufferingSupported", result) is bool buffering) || !buffering
-                || Reflect.Call(source, "IsHls", result, ms) is bool hls && hls)
+            var st = new State
             {
-                // HLS u otro formato que Emby no guarda en su buffer: su apertura de siempre
-                (response as IDisposable)?.Dispose();
-                (context as IDisposable)?.Dispose();
-                Log(source, "Intro: la fuente no es MPEG-TS, apertura normal");
-                Original(source, ct);
-                return;
-            }
-
-            var st = new State { Source = source, MediaSource = ms };
-            var streamCts = (CancellationTokenSource)Reflect.Get(source, "LiveStreamCancellationTokenSource");
+                Source = source,
+                MediaSource = ms,
+                Intro = intro,
+                OriginalUrl = Reflect.Get(ms, "Path") as string,
+                OriginalProtocol = Reflect.Get(ms, "Protocol"),
+                Main = (CancellationTokenSource)Reflect.Get(source, "LiveStreamCancellationTokenSource"),
+            };
+            st.Token = st.Main.Token;
+            var started = DateTime.UtcNow;
             try
             {
                 Prepare(st);
-                st.Token = streamCts.Token;
+                var first = OpenFirst(st, ct);
                 lock (Sync) States[source] = st;
-                st.Token.Register(() => Forget(st));
+                st.Token.Register(() => Cleanup(st));
+                StartGen(st, first);
 
-                var tcs = new TaskCompletionSource<bool>();
-                Reflect.Call(source, "StartStreaming", ms, response, context, Reflect.Get(result, "ResponseUrl"),
-                    Reflect.Get(result, "MediaProtocol"), tcs, st.Token);
-                tcs.Task.GetAwaiter().GetResult();
-
-                var started = DateTime.UtcNow;
                 var format = WaitFormat(st, ct);
                 if (format == null)
                 {
-                    Log(source, "Intro: no llega la tabla de pistas y un fotograma clave en 20 s, se sigue sin intro");
-                    WithoutIntro(st, ct, null);
-                    return;
+                    Log(source, "Puente: el origen no da formato en " + FormatWait + " s; se arranca con la intro en formato estándar");
+                    format = DefaultFormat(st);
+                    st.DefaultFormat = true;
                 }
-                var probePath = Path.Combine(st.Dir, "probe.ts");
-                Probe(st, probePath, ct);
-                Log(source, "Intro: formato del canal listo en " + Ms(started) + " ms: " + Describe(format));
+                else Log(source, "Puente: formato del origen en " + Ms(started) + " ms: " + Describe(format) + (st.Remuxed ? " (entra por ffmpeg)" : ""));
+                st.Format = format;
+                st.Material = Material(st, format);
+                st.FrameDur = FrameDuration(format);
 
-                var args = EncoderArguments(st, format, intro);
-                if (args == null) { WithoutIntro(st, ct, "formato sin codificador para la intro"); return; }
-                if (!StartEncoder(st, args)) { WithoutIntro(st, ct, "no arranca ffmpeg: " + st.EncoderError); return; }
-                var first = TakeEncoded(st, 15000);
-                var second = first == null ? null : TakeEncoded(st, 15000);
-                var latest = second == null ? null : LatestPts(st);
-                if (latest == null)
+                if (st.PassThrough)
                 {
-                    StopEncoder(st);
-                    WithoutIntro(st, ct, "la intro no se codifica a tiempo: " + st.EncoderError);
+                    // sin vídeo (radio): se publica tal cual
+                    Probe(st, Path.Combine(st.BaseDir, "probe.ts"), ct);
+                    StartPublisher(st);
                     return;
                 }
-                var d0 = (long)((object[])first)[2];
-                var d1 = (long)((object[])second)[2];
-                var start = Mod(latest.Value - d0 - d1);
-                st.Shift = Mod(start - (long)((object[])first)[1]);
-                PublishIntro(st, Emit(st, (byte[])((object[])first)[0], null, null), d0);
-                PublishIntro(st, Emit(st, (byte[])((object[])second)[0], null, null), d1);
-                Log(source, "Intro: emitiendo desde " + Ms(started) + " ms");
-                var feeder = new Thread(() => Feed(st, Mod(start + d0 + d1))) { IsBackground = true, Name = "EmbyNoShare intro" };
-                feeder.Start();
+
+                StartEncoder(st);
+                var a = st.Enc == null ? null : TakeEncoded(st.Enc, 15000);
+                var b = a == null ? null : TakeEncoded(st.Enc, 15000);
+                if (b == null)
+                {
+                    var error = st.Enc?.Error.Trim() ?? "";
+                    StopEncoder(st);
+                    if (st.DefaultFormat) throw new Exception("Puente: ni el origen ni la intro responden: " + error);
+                    Log(source, "Puente: la intro no arranca, se sigue sin ella: " + error);
+                }
+                else
+                {
+                    if (st.DefaultFormat) ApplyTables(st, ParseTables((byte[])((object[])a)[0]));
+                    PublishIntro(st, (object[])a);
+                    PublishIntro(st, (object[])b);
+                }
+                Probe(st, st.DefaultFormat ? LastPublishedPath(st) : Path.Combine(st.BaseDir, "probe.ts"), ct);
+                Log(source, "Puente: canal listo en " + Ms(started) + " ms");
+                StartPublisher(st);
             }
             catch
             {
-                StopEncoder(st);
-                Forget(st);
-                try { streamCts.Cancel(); } catch { }
+                Cleanup(st);
+                try { st.Main.Cancel(); } catch { }
                 throw;
             }
         }
 
-        /// La apertura original de Emby (el gancho la deja pasar)
-        static void Original(object source, CancellationToken ct)
-        {
-            lock (Sync) Bypass.Add(source);
-            try { ((Task)Reflect.Call(source, "OpenInternal", ct)).GetAwaiter().GetResult(); }
-            finally { lock (Sync) Bypass.Remove(source); }
-        }
-
-        static void Forget(State st)
+        static void Cleanup(State st)
         {
             lock (Sync) States.Remove(st.Source);
             StopEncoder(st);
+            var gen = st.Gen;
+            if (gen != null) StopGen(gen);
         }
 
-        /// Lo que hace OpenInternal antes de empezar a leer la fuente
+        /// Lo que hace OpenInternal antes de empezar a leer el origen
         static void Prepare(State st)
         {
             var source = st.Source;
@@ -225,107 +301,329 @@ namespace EmbyNoShare.Runtime
                 if (Reflect.Get(options, "BufferLimitInMinutes") is int minutes) limit = TimeSpan.FromMinutes(minutes);
             }
             catch { }
-            if (limit > TimeSpan.Zero)
-            {
-                if (limit < TimeSpan.FromMinutes(10)) limit = TimeSpan.FromMinutes(10);
-            }
+            if (limit > TimeSpan.Zero && limit < TimeSpan.FromMinutes(10)) limit = TimeSpan.FromMinutes(10);
             Reflect.Set(source, "BufferLimit", limit);
             st.Uid = (string)Reflect.Get(source, "UniqueId");
             var temp = (string)Reflect.Call(Reflect.Get(source, "AppPaths"), "GetTranscodingTempPath");
-            st.Dir = Path.Combine(temp, st.Uid);
-            Reflect.Set(source, "TempFilePath", Path.Combine(st.Dir, "{0:0000000}.ts"));
-            Directory.CreateDirectory(st.Dir);
+            st.BaseDir = Path.Combine(temp, st.Uid);
+            st.BasePattern = Path.Combine(st.BaseDir, "{0:0000000}.ts");
+            Reflect.Set(source, "TempFilePath", st.BasePattern);
+            Directory.CreateDirectory(st.BaseDir);
             st.InfoType = Reflect.Get(source, "CompletedSegmentFiles").GetType().GetGenericArguments()[0];
         }
 
-        /// Emby analiza lo recibido del canal (como en OpenInternal) y deja la fuente lista para los lectores
-        static void Probe(State st, string probePath, CancellationToken ct)
+        /// Primera conexión: decide si el origen entra directo (MPEG-TS) o por ffmpeg (HLS, mp4, mkv...)
+        static object OpenFirst(State st, CancellationToken ct)
         {
-            var ms = st.MediaSource;
-            var protocolType = Reflect.Get(ms, "Protocol").GetType();
-            Reflect.Set(ms, "ProbePath", probePath);
-            Reflect.Set(ms, "ProbeProtocol", Enum.Parse(protocolType, "File"));
-            var local = (string)Reflect.Call(Reflect.Get(st.Source, "_appHost"), "GetLocalApiUrl", "127.0.0.1");
-            Reflect.Set(ms, "Path", local + "/LiveTv/LiveStreamFiles/" + st.Uid + "/stream.ts");
-            ((Task)Reflect.Call(st.Source, "AddMediaInfoWithProbe", false, ct)).GetAwaiter().GetResult();
-            Reflect.Set(ms, "Container", "mpegts");
-            Reflect.Set(ms, "Path", local + "/LiveTv/LiveStreamFiles/" + st.Uid + "/stream.ts");
-            Reflect.Set(ms, "DirectStreamUrl", "/LiveTv/LiveStreamFiles/" + st.Uid + "/hls/master.m3u8");
-            Reflect.Set(ms, "AddApiKeyToDirectStreamUrl", true);
-            Reflect.Set(ms, "HasMixedProtocols", true);
-            Reflect.Set(ms, "TrancodeLiveStartIndex", (int?)0);
-            Reflect.Set(ms, "Protocol", Enum.Parse(protocolType, "Http"));
-            Reflect.Set(ms, "IsRemote", false);
-            Reflect.Set(ms, "RequiresLooping", false);
-            Reflect.Set(ms, "SupportsDirectPlay", false);
-            Reflect.Set(ms, "SupportsDirectStream", true);
-            Reflect.Set(ms, "SupportsTranscoding", true);
+            var source = st.Source;
+            var opening = (Task)Reflect.Call(source, "OpenStream", null, st.MediaSource, st.OriginalUrl, st.OriginalProtocol, ct, 0);
+            opening.GetAwaiter().GetResult();
+            var result = Reflect.Get(opening, "Result");
+            var contentType = Reflect.Get(result, "ContentType") as string ?? "";
+            var responseUrl = Reflect.Get(result, "ResponseUrl") as string ?? st.OriginalUrl;
+            var hls = IsHlsUrl(st.OriginalUrl) || IsHlsUrl(responseUrl) || contentType.IndexOf("mpegurl", StringComparison.OrdinalIgnoreCase) >= 0;
+            if (!hls && !IsOtherContainer(contentType)) return result;
+
+            st.Remuxed = true;
+            st.RemuxUrl = responseUrl;
+            var response = Reflect.Get(result, "ResponseInfo");
+            if (hls)
+            {
+                try
+                {
+                    var content = Reflect.Get(response, "Content") as Stream;
+                    if (content != null)
+                    {
+                        string text;
+                        using (var reader = new StreamReader(content)) text = ReadLimited(reader, 1024 * 1024);
+                        ChooseVariant(st, responseUrl, text);
+                    }
+                }
+                catch (Exception e) { Log(source, "Puente: no se pudo leer la lista HLS, se deja elegir a ffmpeg: " + e.Message); }
+            }
+            (response as IDisposable)?.Dispose();
+            (Reflect.Get(result, "ConectionContext") as IDisposable)?.Dispose();
+            Log(source, "Puente: origen " + (hls ? "HLS" : contentType) + ", entra por ffmpeg desde " + Sanitize(st.RemuxUrl));
+            return Remux(st, null, ct);
         }
 
-        /// Sin intro: se publica el canal tal cual y se espera a dos trozos, como Emby
-        static void WithoutIntro(State st, CancellationToken ct, string reason)
+        static bool IsHlsUrl(string url)
         {
-            if (reason != null) Log(st.Source, "Intro: se sigue sin intro: " + reason);
-            Switch(st, 0, false);
-            var probed = reason != null;    // con motivo, Emby ya analizó el canal
-            var start = DateTime.UtcNow;
-            while (Count(Reflect.Call(st.Source, "GetSegments")) < 2 && (DateTime.UtcNow - start).TotalSeconds < 8)
-            {
-                ct.ThrowIfCancellationRequested();
-                Thread.Sleep(50);
-            }
-            if (!probed)
-            {
-                var files = new List<string>();
-                if (Reflect.Call(st.Source, "GetStreamFiles") is System.Collections.IList list)
-                    foreach (var f in list) files.Add(Reflect.Get(f, "Path") as string);
-                var path = string.Join("|", files.ToArray());
-                Probe(st, path, ct);
-            }
+            if (string.IsNullOrEmpty(url)) return false;
+            var q = url.IndexOf('?');
+            var p = q >= 0 ? url.Substring(0, q) : url;
+            return p.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase) || p.EndsWith(".m3u", StringComparison.OrdinalIgnoreCase);
         }
 
-        static int Count(object list) => list is System.Collections.ICollection c ? c.Count : 0;
+        static bool IsOtherContainer(string contentType)
+        {
+            foreach (var t in new[] { "matroska", "mkv", "mp4", "avi", "webm", "dash", "flv", "quicktime" })
+                if (contentType.IndexOf(t, StringComparison.OrdinalIgnoreCase) >= 0) return true;
+            return false;
+        }
+
+        static string ReadLimited(StreamReader reader, int max)
+        {
+            var buffer = new char[8192];
+            var b = new StringBuilder();
+            int n;
+            while (b.Length < max && (n = reader.Read(buffer, 0, buffer.Length)) > 0) b.Append(buffer, 0, n);
+            return b.ToString();
+        }
+
+        /// Lista maestra HLS: la variante de más resolución y caudal (si las pistas de audio van aparte, la maestra
+        /// con solo el programa de esa variante)
+        static void ChooseVariant(State st, string url, string text)
+        {
+            if (text.IndexOf("#EXT-X-STREAM-INF", StringComparison.OrdinalIgnoreCase) < 0) return;
+            var lines = text.Replace("\r", "").Split('\n');
+            string best = null;
+            long bestScore = -1;
+            int bestIndex = -1, index = -1;
+            for (var i = 0; i < lines.Length; i++)
+            {
+                if (!lines[i].StartsWith("#EXT-X-STREAM-INF", StringComparison.OrdinalIgnoreCase)) continue;
+                index++;
+                long bandwidth = 0, pixels = 0;
+                var m = System.Text.RegularExpressions.Regex.Match(lines[i], @"[:,]BANDWIDTH=(\d+)");
+                if (m.Success) long.TryParse(m.Groups[1].Value, out bandwidth);
+                m = System.Text.RegularExpressions.Regex.Match(lines[i], @"RESOLUTION=(\d+)x(\d+)");
+                if (m.Success) pixels = long.Parse(m.Groups[1].Value, CultureInfo.InvariantCulture) * long.Parse(m.Groups[2].Value, CultureInfo.InvariantCulture);
+                var score = pixels * 1000000000L + bandwidth;
+                var j = i + 1;
+                while (j < lines.Length && (lines[j].Trim().Length == 0 || lines[j].StartsWith("#", StringComparison.Ordinal))) j++;
+                if (j >= lines.Length) continue;
+                if (score > bestScore) { bestScore = score; best = lines[j].Trim(); bestIndex = index; }
+            }
+            if (best == null) return;
+            var separateAudio = System.Text.RegularExpressions.Regex.IsMatch(text, @"#EXT-X-MEDIA:[^\n]*TYPE=AUDIO[^\n]*URI=", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+            if (separateAudio) st.RemuxMap = "-map 0:p:" + bestIndex.ToString(CultureInfo.InvariantCulture) + ":v? -map 0:p:" + bestIndex.ToString(CultureInfo.InvariantCulture) + ":a?";
+            else st.RemuxUrl = new Uri(new Uri(url), best).ToString();
+        }
+
+        /// El origen convertido a MPEG-TS sin recodificar por el ffmpeg de Emby, como respuesta de OpenStream
+        static object Remux(State st, object context, CancellationToken ct)
+        {
+            ct.ThrowIfCancellationRequested();
+            var args = new StringBuilder("-hide_banner -nostdin -loglevel error -fflags +genpts+discardcorrupt");
+            var headers = Reflect.Get(st.MediaSource, "RequiredHttpHeaders") as System.Collections.IDictionary;
+            var extra = new StringBuilder();
+            if (headers != null)
+                foreach (System.Collections.DictionaryEntry h in headers)
+                {
+                    var name = h.Key as string;
+                    var value = h.Value as string;
+                    if (string.IsNullOrEmpty(name) || value == null) continue;
+                    if (string.Equals(name, "User-Agent", StringComparison.OrdinalIgnoreCase)) args.Append(" -user_agent ").Append(Quote(value));
+                    else extra.Append(name).Append(": ").Append(value).Append("\r\n");
+                }
+            if (extra.Length > 0) args.Append(" -headers ").Append(Quote(extra.ToString()));
+            if (st.RemuxUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase) && !IsHlsUrl(st.RemuxUrl))
+                args.Append(" -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 4");
+            args.Append(" -i ").Append(Quote(st.RemuxUrl));
+            args.Append(' ').Append(st.RemuxMap ?? "-map 0:v? -map 0:a?");
+            args.Append(" -c copy -f mpegts pipe:1");
+            var info = new ProcessStartInfo(Tool("ffmpeg"), args.ToString())
+            {
+                UseShellExecute = false,
+                RedirectStandardOutput = true,
+                RedirectStandardError = true,
+                CreateNoWindow = true,
+                WorkingDirectory = AppDir(),
+            };
+            var process = Process.Start(info);
+            process.ErrorDataReceived += (sender, e) => { if (!string.IsNullOrEmpty(e.Data)) Log(st.Source, "Puente: ffmpeg del origen: " + e.Data); };
+            process.BeginErrorReadLine();
+            lock (st)
+            {
+                if (st.Gen != null) lock (st.Gen.Remux) st.Gen.Remux.Add(process);
+                else st.FirstRemux = process;
+            }
+
+            var resultType = OpenStreamResultType(st.Source);
+            var ctor = resultType.GetConstructors()[0];
+            var ps = ctor.GetParameters();
+            var response = Activator.CreateInstance(ps[0].ParameterType, new object[] { new IDisposable[] { process } });
+            Reflect.Set(response, "Content", process.StandardOutput.BaseStream);
+            Reflect.Set(response, "ContentType", "video/mp2t");
+            Reflect.Set(response, "ResponseUrl", st.RemuxUrl);
+            Reflect.Set(response, "StatusCode", HttpStatusCode.OK);
+            var http = Enum.Parse(ps[5].ParameterType, "Http");
+            return ctor.Invoke(new[] { response, context, st.RemuxUrl, st.RemuxUrl, "video/mp2t", http });
+        }
+
+        static Type OpenStreamResultType(object source)
+        {
+            for (var t = source.GetType(); t != null; t = t.BaseType)
+                foreach (var m in t.GetMethods(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.DeclaredOnly))
+                    if (m.Name == "OpenStream" && m.ReturnType.IsGenericType) return m.ReturnType.GetGenericArguments()[0];
+            throw new MissingMethodException(source.GetType().FullName, "OpenStream");
+        }
 
         // ---------------------------------------------------------------------------------------------------------
-        // Formato del canal
+        // Generaciones de la ingesta
 
-        /// Espera a que lo retenido del canal tenga la tabla de pistas y el formato de todas ellas (ffprobe)
+        /// Empieza a escribir el buffer desde una respuesta del origen, en la carpeta de una generación nueva
+        static void StartGen(State st, object result)
+        {
+            var gen = new Gen { Cts = CancellationTokenSource.CreateLinkedTokenSource(st.Token) };
+            lock (st)
+            {
+                gen.Id = ++st.GenCount;
+                gen.Dir = Path.Combine(st.BaseDir, "g" + gen.Id.ToString(CultureInfo.InvariantCulture));
+                Directory.CreateDirectory(gen.Dir);
+                st.Gen = gen;
+                st.GenStartedAt = DateTime.UtcNow;
+                if (st.FirstRemux != null) { gen.Remux.Add(st.FirstRemux); st.FirstRemux = null; }
+                st.Held.Clear();
+                st.Done.Clear();
+                st.LastActivity = DateTime.UtcNow;
+                st.ActivityKey = null;
+            }
+            if (result == null) return;
+            // StartStreaming lee TempFilePath al arrancar su tarea (antes de completar tcs)
+            lock (st.GenLock)
+            {
+                Reflect.Set(st.Source, "TempFilePath", Path.Combine(gen.Dir, "{0:0000000}.ts"));
+                try
+                {
+                    var tcs = new TaskCompletionSource<bool>();
+                    Reflect.Call(st.Source, "StartStreaming", st.MediaSource, Reflect.Get(result, "ResponseInfo"), Reflect.Get(result, "ConectionContext"),
+                        Reflect.Get(result, "ResponseUrl"), Reflect.Get(result, "MediaProtocol"), tcs, gen.Cts.Token);
+                    tcs.Task.Wait(15000);
+                }
+                finally { Reflect.Set(st.Source, "TempFilePath", st.BasePattern); }
+            }
+        }
+
+        static void StopGen(Gen gen)
+        {
+            try { gen.Cts.Cancel(); } catch { }
+            List<Process> remux;
+            lock (gen.Remux) remux = new List<Process>(gen.Remux);
+            foreach (var p in remux) { try { if (!p.HasExited) p.Kill(); } catch { } }
+        }
+
+        /// Otra conexión con el origen (en segundo plano), con espera creciente si va fallando
+        static void RestartGen(State st, double delaySeconds)
+        {
+            lock (st)
+            {
+                if (st.GenStarting || st.Token.IsCancellationRequested) return;
+                st.GenStarting = true;
+            }
+            var old = st.Gen;
+            Task.Run(() =>
+            {
+                try
+                {
+                    if (delaySeconds > 0) Thread.Sleep(TimeSpan.FromSeconds(delaySeconds));
+                    if (old != null) StopGen(old);
+                    StartGen(st, null);       // carpeta y retención nuevas antes de conectar
+                    var opening = (Task)Reflect.Call(st.Source, "OpenStream", null, st.MediaSource, st.Remuxed ? st.RemuxUrl : st.OriginalUrl, st.OriginalProtocol, st.Gen.Cts.Token, 0);
+                    opening.GetAwaiter().GetResult();
+                    var result = Reflect.Get(opening, "Result");
+                    lock (st.GenLock)
+                    {
+                        var gen = st.Gen;
+                        Reflect.Set(st.Source, "TempFilePath", Path.Combine(gen.Dir, "{0:0000000}.ts"));
+                        try
+                        {
+                            var tcs = new TaskCompletionSource<bool>();
+                            Reflect.Call(st.Source, "StartStreaming", st.MediaSource, Reflect.Get(result, "ResponseInfo"), Reflect.Get(result, "ConectionContext"),
+                                Reflect.Get(result, "ResponseUrl"), Reflect.Get(result, "MediaProtocol"), tcs, gen.Cts.Token);
+                            tcs.Task.Wait(15000);
+                        }
+                        finally { Reflect.Set(st.Source, "TempFilePath", st.BasePattern); }
+                    }
+                    Log(st.Source, "Puente: conexión " + st.Gen.Id.ToString(CultureInfo.InvariantCulture) + " con el origen abierta");
+                }
+                catch (Exception e)
+                {
+                    st.GenFailures++;
+                    Log(st.Source, "Puente: no se pudo reconectar con el origen (" + st.GenFailures.ToString(CultureInfo.InvariantCulture) + "): " + Inner(e).Message);
+                }
+                finally
+                {
+                    st.NextGenRestart = DateTime.UtcNow.AddSeconds(Math.Min(30, 5 * Math.Max(1, st.GenFailures)));
+                    lock (st) { st.GenStarting = false; st.LastActivity = DateTime.UtcNow; }
+                    if (old != null)
+                        Task.Delay(15000).ContinueWith(_ => { try { Directory.Delete(old.Dir, true); } catch { } });
+                }
+            });
+        }
+
+        static Exception Inner(Exception e)
+        {
+            while ((e is System.Reflection.TargetInvocationException || e is AggregateException) && e.InnerException != null) e = e.InnerException;
+            return e;
+        }
+
+        // ---------------------------------------------------------------------------------------------------------
+        // Formato del origen
+
+        /// Espera a que lo retenido del origen tenga la tabla de pistas y el formato de todas ellas (ffprobe)
         static JsonElement[] WaitFormat(State st, CancellationToken ct)
         {
             var start = DateTime.UtcNow;
-            DateTime? videoReady = null;
-            var probePath = Path.Combine(st.Dir, "probe.ts");
-            while ((DateTime.UtcNow - start).TotalSeconds < 20)
+            DateTime? ready = null;
+            var probePath = Path.Combine(st.BaseDir, "probe.ts");
+            while ((DateTime.UtcNow - start).TotalSeconds < FormatWait)
             {
                 ct.ThrowIfCancellationRequested();
-                Thread.Sleep(videoReady == null ? 150 : 250);
+                Thread.Sleep(ready == null ? 150 : 250);
                 var data = Snapshot(st, 12 * 1024 * 1024);
-                if (data.Length < 188 * 20 || !ParseTables(st, data)) continue;
+                if (data.Length < 188 * 20) continue;
+                var tables = ParseTables(data);
+                if (tables == null) continue;
                 File.WriteAllBytes(probePath, data);
                 var streams = FfprobeStreams(probePath);
                 if (streams == null) continue;
+                var videoPid = (int)tables[4];
                 JsonElement? video = null;
                 var audioMissing = false;
+                var audioCount = 0;
                 foreach (var s in streams)
                 {
                     var type = Str(s, "codec_type");
-                    if (type == "video" && video == null && Int(s, "width") > 0 && Int(s, "height") > 0
-                        && Str(s, "pix_fmt") != null && Rate(s) != null && Pid(s) == st.VideoPid)
+                    if (type == "video" && video == null && Pid(s) == videoPid && Int(s, "width") > 0 && Int(s, "height") > 0
+                        && Str(s, "pix_fmt") != null && Rate(s) != null)
                         video = s;
-                    if (type == "audio" && (Int(s, "sample_rate") <= 0 || Int(s, "channels") <= 0)) audioMissing = true;
+                    if (type == "audio") { audioCount++; if (Int(s, "sample_rate") <= 0 || Int(s, "channels") <= 0) audioMissing = true; }
                 }
-                if (st.VideoPid < 0 || video == null) continue;
-                if (videoReady == null) videoReady = DateTime.UtcNow;
-                var waited = (DateTime.UtcNow - videoReady.Value).TotalSeconds;
+                if (videoPid >= 0 && video == null) continue;
+                if (videoPid < 0 && audioCount == 0) continue;
+                if (ready == null) ready = DateTime.UtcNow;
+                var waited = (DateTime.UtcNow - ready.Value).TotalSeconds;
                 // el orden de campos sale al decodificar algún fotograma; el audio inactivo puede no llegar nunca
-                if (Str(video.Value, "field_order") == null && waited < 1.5) continue;
+                if (video != null && Str(video.Value, "field_order") == null && waited < 1.5) continue;
                 if (audioMissing && waited < 2) continue;
+                ApplyTables(st, tables);
+                st.Signature = Signature(data, tables);
+                st.PassThrough = videoPid < 0;
                 return streams;
             }
             return null;
         }
 
-        /// Lo retenido del canal hasta ahora, seguido
+        /// H.264 1080p25 + AAC estéreo, para arrancar si el origen no da nada a tiempo
+        static JsonElement[] DefaultFormat(State st)
+        {
+            const string json = "[{\"codec_type\":\"video\",\"codec_name\":\"h264\",\"profile\":\"High\",\"level\":40,\"width\":1920,\"height\":1080,"
+                + "\"pix_fmt\":\"yuv420p\",\"r_frame_rate\":\"25/1\",\"avg_frame_rate\":\"25/1\",\"field_order\":\"progressive\",\"has_b_frames\":2,"
+                + "\"sample_aspect_ratio\":\"1:1\",\"id\":\"0x100\"},{\"codec_type\":\"audio\",\"codec_name\":\"aac\",\"sample_rate\":48000,\"channels\":2,\"id\":\"0x101\"}]";
+            var list = new List<JsonElement>();
+            using (var doc = JsonDocument.Parse(json))
+                foreach (var e in doc.RootElement.EnumerateArray()) list.Add(e.Clone());
+            st.VideoPid = 0x100;
+            st.PcrPid = 0x100;
+            st.MediaPids.Clear();
+            st.MediaPids.Add(0x100);
+            st.MediaPids.Add(0x101);
+            return list.ToArray();
+        }
+
+        /// Lo retenido del origen hasta ahora, seguido
         static byte[] Snapshot(State st, int max)
         {
             var files = new List<string>();
@@ -358,8 +656,19 @@ namespace EmbyNoShare.Runtime
             catch { return new byte[0]; }
         }
 
-        /// PAT y PMT del canal (los paquetes exactos, para repetirlos en la intro) y sus PID
-        static bool ParseTables(State st, byte[] data)
+        static long FileSize(string file)
+        {
+            try { return new FileInfo(file).Length; } catch { return -1; }
+        }
+
+        static void TryDelete(string path)
+        {
+            try { if (!string.IsNullOrEmpty(path)) File.Delete(path); } catch { }
+        }
+
+        /// PAT y PMT (paquetes exactos), su PID, PID de reloj y de vídeo, PID de las pistas y tipos:
+        /// {byte[][] pat, byte[][] pmt, int pmtPid, int pcrPid, int videoPid, HashSet&lt;int&gt; pids, Dictionary&lt;int,int&gt; tipos, byte[] sección PMT}
+        static object[] ParseTables(byte[] data)
         {
             byte[][] pat = null;
             int pmtPid = -1;
@@ -380,9 +689,8 @@ namespace EmbyNoShare.Runtime
                 }
                 if (pmtPid >= 0) pat = new[] { Copy(data, p) };
             }
-            if (pat == null) return false;
+            if (pat == null) return null;
 
-            // PMT: desde un paquete con inicio de sección hasta completarla
             for (var p = 0; p + 188 <= data.Length; p += 188)
             {
                 if (data[p] != 0x47 || PidOf(data, p) != pmtPid || (data[p + 1] & 0x40) == 0) continue;
@@ -407,26 +715,135 @@ namespace EmbyNoShare.Runtime
                 var s = section.ToArray();
                 if (s.Length < 12 || s[0] != 2) continue;
                 var total = 3 + (((s[1] & 0x0F) << 8) | s[2]);
-                if (s.Length < total) return false;
-                st.PcrPid = ((s[8] & 0x1F) << 8) | s[9];
+                if (s.Length < total) return null;
+                var pcrPid = ((s[8] & 0x1F) << 8) | s[9];
                 var infoLength = ((s[10] & 0x0F) << 8) | s[11];
-                st.MediaPids.Clear();
-                st.VideoPid = -1;
+                var pids = new HashSet<int>();
+                var types = new Dictionary<int, int>();
+                var videoPid = -1;
                 for (var e = 12 + infoLength; e + 5 <= total - 4;)
                 {
                     var type = s[e];
                     var pid = ((s[e + 1] & 0x1F) << 8) | s[e + 2];
                     var esLength = ((s[e + 3] & 0x0F) << 8) | s[e + 4];
-                    st.MediaPids.Add(pid);
-                    if (st.VideoPid < 0 && (type == 0x01 || type == 0x02 || type == 0x1B || type == 0x24)) st.VideoPid = pid;
+                    pids.Add(pid);
+                    types[pid] = type;
+                    if (videoPid < 0 && (type == 0x01 || type == 0x02 || type == 0x1B || type == 0x24)) videoPid = pid;
                     e += 5 + esLength;
                 }
-                st.Pat = pat;
-                st.Pmt = packets.ToArray();
-                st.PmtPid = pmtPid;
-                return true;
+                var sectionBytes = new byte[total];
+                Array.Copy(s, sectionBytes, total);
+                return new object[] { pat, packets.ToArray(), pmtPid, pcrPid, videoPid, pids, types, sectionBytes };
             }
-            return false;
+            return null;
+        }
+
+        /// Usa las tablas del origen; si su contenido cambia, la versión publicada sube (y se recalcula el CRC)
+        static void ApplyTables(State st, object[] tables)
+        {
+            var pat = Clone((byte[][])tables[0]);
+            var pmt = Clone((byte[][])tables[1]);
+            st.PmtPid = (int)tables[2];
+            st.PcrPid = (int)tables[3];
+            st.VideoPid = (int)tables[4];
+            st.MediaPids.Clear();
+            foreach (var pid in (HashSet<int>)tables[5]) st.MediaPids.Add(pid);
+            var patBody = SectionBody(pat);
+            if (patBody != st.PatBody) { st.PatVersion = st.PatVersion < 0 ? SectionVersion(pat) : (st.PatVersion + 1) & 31; st.PatBody = patBody; }
+            var pmtBody = SectionBody(pmt);
+            if (pmtBody != st.PmtBody) { st.PmtVersion = st.PmtVersion < 0 ? SectionVersion(pmt) : (st.PmtVersion + 1) & 31; st.PmtBody = pmtBody; }
+            SetSectionVersion(pat, st.PatVersion);
+            SetSectionVersion(pmt, st.PmtVersion);
+            st.Pat = pat;
+            st.Pmt = pmt;
+        }
+
+        static byte[][] Clone(byte[][] packets)
+        {
+            var copy = new byte[packets.Length][];
+            for (var i = 0; i < packets.Length; i++) copy[i] = (byte[])packets[i].Clone();
+            return copy;
+        }
+
+        /// Firma barata de lo que define el formato: PMT y cabeceras de secuencia del vídeo (SPS, VPS, MPEG-2)
+        static string Signature(byte[] data, object[] tables)
+        {
+            if (tables == null) return null;
+            var section = (byte[])tables[7];
+            var b = new StringBuilder();
+            for (var i = 0; i < section.Length - 4; i++) if (i != 5) b.Append(section[i].ToString("x2", CultureInfo.InvariantCulture));
+            var videoPid = (int)tables[4];
+            if (videoPid < 0) return b.ToString();
+            var types = (Dictionary<int, int>)tables[6];
+            var type = types.TryGetValue(videoPid, out var t) ? t : 0;
+            // carga del primer PES de vídeo (hasta 8 KB)
+            var payload = new MemoryStream();
+            var started = false;
+            for (var p = 0; p + 188 <= data.Length && payload.Length < 8192; p += 188)
+            {
+                if (data[p] != 0x47 || PidOf(data, p) != videoPid) continue;
+                var pusi = (data[p + 1] & 0x40) != 0;
+                if (pusi && started) break;
+                if (pusi) started = true;
+                if (!started) continue;
+                var o = PayloadOffset(data, p);
+                if (o < 0) continue;
+                if (pusi && o + 9 <= p + 188 && data[o] == 0 && data[o + 1] == 0 && data[o + 2] == 1) o += 9 + data[o + 8];
+                if (o < p + 188) payload.Write(data, o, p + 188 - o);
+            }
+            var v = payload.ToArray();
+            b.Append('|');
+            for (var i = 0; i + 4 < v.Length; i++)
+            {
+                if (v[i] != 0 || v[i + 1] != 0 || v[i + 2] != 1) continue;
+                var h = v[i + 3];
+                var take = 0;
+                if (type == 0x1B && (h & 0x1F) == 7) take = 64;                                            // H.264 SPS
+                else if (type == 0x24 && (((h >> 1) & 0x3F) == 32 || ((h >> 1) & 0x3F) == 33)) take = 64;  // HEVC VPS/SPS
+                else if ((type == 0x01 || type == 0x02) && h == 0xB3) take = 8;                            // MPEG-2 secuencia
+                else if ((type == 0x01 || type == 0x02) && h == 0xB5 && (v[i + 4] >> 4) == 1) take = 6;    // MPEG-2 extensión
+                if (take == 0) continue;
+                for (var k = i + 3; k < v.Length && k < i + 3 + take; k++)
+                {
+                    if (k + 2 < v.Length && v[k] == 0 && v[k + 1] == 0 && (v[k + 2] == 1 || v[k + 2] == 0)) break;
+                    b.Append(v[k].ToString("x2", CultureInfo.InvariantCulture));
+                }
+                b.Append(',');
+            }
+            return b.ToString();
+        }
+
+        /// Lo que obliga a decidir de nuevo: códec, resolución, entrelazado, fps y pistas de audio
+        static string Material(State st, JsonElement[] streams)
+        {
+            var b = new StringBuilder();
+            foreach (var s in streams)
+            {
+                var pid = Pid(s);
+                if (st.MediaPids.Count > 0 && !st.MediaPids.Contains(pid)) continue;
+                var type = Str(s, "codec_type");
+                if (type == "video")
+                {
+                    var field = Str(s, "field_order") ?? "progressive";
+                    b.Append(string.Format(CultureInfo.InvariantCulture, "v{0}:{1}:{2}x{3}:{4}:{5}:{6};", pid, Str(s, "codec_name"), Int(s, "width"),
+                        Int(s, "height"), field == "progressive" ? "p" : "i", Rate(s), Str(s, "pix_fmt")));
+                }
+                else if (type == "audio")
+                    b.Append(string.Format(CultureInfo.InvariantCulture, "a{0}:{1}:{2};", pid, Str(s, "codec_name"), Int(s, "channels")));
+                else b.Append(string.Format(CultureInfo.InvariantCulture, "o{0}:{1};", pid, Str(s, "codec_name") ?? type));
+            }
+            return b.ToString();
+        }
+
+        static long FrameDuration(JsonElement[] streams)
+        {
+            foreach (var s in streams)
+                if (Str(s, "codec_type") == "video")
+                {
+                    var fps = Fps(Rate(s));
+                    if (fps > 0) return (long)Math.Round(Clock / fps);
+                }
+            return Clock / 25;
         }
 
         static string Describe(JsonElement[] streams)
@@ -444,6 +861,597 @@ namespace EmbyNoShare.Runtime
                 else parts.Add((Str(s, "codec_name") ?? type) + " pid " + Pid(s));
             }
             return string.Join(", ", parts.ToArray());
+        }
+
+        /// Emby analiza un trozo (como en OpenInternal) y deja la fuente lista para los lectores
+        static void Probe(State st, string probePath, CancellationToken ct)
+        {
+            var ms = st.MediaSource;
+            var protocolType = Reflect.Get(ms, "Protocol").GetType();
+            Reflect.Set(ms, "ProbePath", probePath);
+            Reflect.Set(ms, "ProbeProtocol", Enum.Parse(protocolType, "File"));
+            var local = (string)Reflect.Call(Reflect.Get(st.Source, "_appHost"), "GetLocalApiUrl", "127.0.0.1");
+            Reflect.Set(ms, "Path", local + "/LiveTv/LiveStreamFiles/" + st.Uid + "/stream.ts");
+            try { ((Task)Reflect.Call(st.Source, "AddMediaInfoWithProbe", false, ct)).GetAwaiter().GetResult(); }
+            catch (Exception e) when (!(e is OperationCanceledException)) { Log(st.Source, "Puente: el análisis de Emby falló: " + Inner(e).Message); }
+            Reflect.Set(ms, "Container", "mpegts");
+            Reflect.Set(ms, "Path", local + "/LiveTv/LiveStreamFiles/" + st.Uid + "/stream.ts");
+            Reflect.Set(ms, "DirectStreamUrl", "/LiveTv/LiveStreamFiles/" + st.Uid + "/hls/master.m3u8");
+            Reflect.Set(ms, "AddApiKeyToDirectStreamUrl", true);
+            Reflect.Set(ms, "HasMixedProtocols", true);
+            Reflect.Set(ms, "TrancodeLiveStartIndex", (int?)0);
+            Reflect.Set(ms, "Protocol", Enum.Parse(protocolType, "Http"));
+            Reflect.Set(ms, "IsRemote", false);
+            Reflect.Set(ms, "RequiresLooping", false);
+            Reflect.Set(ms, "SupportsDirectPlay", false);
+            Reflect.Set(ms, "SupportsDirectStream", true);
+            Reflect.Set(ms, "SupportsTranscoding", true);
+        }
+
+        // ---------------------------------------------------------------------------------------------------------
+        // Publicación
+
+        static void StartPublisher(State st)
+        {
+            var thread = new Thread(() => Publisher(st)) { IsBackground = true, Name = "EmbyNoShare puente " + st.Uid };
+            thread.Start();
+        }
+
+        static void Publisher(State st)
+        {
+            var errors = 0;
+            while (!st.Token.IsCancellationRequested)
+            {
+                try
+                {
+                    Step(st);
+                    errors = 0;
+                }
+                catch (Exception e)
+                {
+                    errors++;
+                    if (errors <= 3 || errors % 200 == 0) Log(st.Source, "Puente: error (" + errors.ToString(CultureInfo.InvariantCulture) + "), se sigue: " + Inner(e));
+                }
+                Thread.Sleep(50);
+            }
+            StopEncoder(st);
+        }
+
+        static void Step(State st)
+        {
+            // trozos del origen terminados, en orden
+            while (true)
+            {
+                object file = null;
+                lock (st)
+                    if (st.Held.Count > 0 && st.Done.Contains(st.Held[0]))
+                    {
+                        file = st.Held[0];
+                        st.Held.RemoveAt(0);
+                        st.Done.Remove(file);
+                    }
+                if (file == null) break;
+                if (st.PassThrough) PublishRaw(st, file);
+                else PublishSource(st, file);
+                st.GenFailures = 0;
+            }
+
+            // ¿llegan datos del origen?
+            string key = null;
+            lock (st)
+                if (st.Held.Count > 0)
+                {
+                    var last = Reflect.Get(st.Held[st.Held.Count - 1], "Path") as string;
+                    key = st.Held.Count.ToString(CultureInfo.InvariantCulture) + "|" + last + "|" + FileSize(last).ToString(CultureInfo.InvariantCulture);
+                }
+            if (key != null && key != st.ActivityKey) { st.ActivityKey = key; st.LastActivity = DateTime.UtcNow; }
+            if (st.PassThrough) { CheckStall(st); return; }
+
+            // puente: más intro si a los lectores se les va a acabar lo publicado
+            var lead = Lead(st);
+            if (st.OutStarted && lead < LowLead)
+            {
+                if (!st.Bridging) Log(st.Source, "Puente: el origen no llega a tiempo (margen " + lead.ToString("0.0", CultureInfo.InvariantCulture) + " s), entra la intro");
+                st.Bridging = true;
+                if (st.Enc != null)
+                {
+                    var segment = TakeEncoded(st.Enc, 0) as object[];
+                    if (segment != null) PublishIntro(st, segment);
+                }
+            }
+            CheckStall(st);
+
+            // intro lista para cuando haga falta
+            if ((st.Enc == null || st.Enc.Done) && DateTime.UtcNow >= st.NextEncoderStart && st.Format != null)
+            {
+                if (st.Enc != null) Log(st.Source, "Puente: el ffmpeg de la intro terminó (" + st.Enc.Error.Trim() + "), se relanza");
+                st.NextEncoderStart = DateTime.UtcNow.AddSeconds(10);
+                StartEncoder(st);
+            }
+        }
+
+        static void CheckStall(State st)
+        {
+            if (st.GenStarting || DateTime.UtcNow < st.NextGenRestart) return;
+            var idle = (DateTime.UtcNow - st.LastActivity).TotalSeconds;
+            if (idle < Stall) return;
+            Log(st.Source, "Puente: " + ((int)idle).ToString(CultureInfo.InvariantCulture) + " s sin datos del origen, se abre otra conexión");
+            RestartGen(st, 0);
+        }
+
+        /// Segundos publicados por delante del ritmo de reproducción
+        static double Lead(State st)
+        {
+            if (!st.OutStarted) return 0;
+            return Mod(st.OutNextDts - st.P0) / (double)Clock - (DateTime.UtcNow - st.W0).TotalSeconds;
+        }
+
+        static void StartOut(State st)
+        {
+            if (st.OutStarted) return;
+            st.OutStarted = true;
+            st.P0 = OutStart;
+            st.OutNextDts = OutStart;
+            st.W0 = DateTime.UtcNow;
+        }
+
+        /// Un trozo del origen: si cambia el formato, Emby lo vuelve a analizar, la intro se regenera y las conversiones
+        /// se relanzan; se publica reescrito sobre la línea de tiempo continua
+        static void PublishSource(State st, object file)
+        {
+            var path = Reflect.Get(file, "Path") as string;
+            var raw = ReadShared(path, 0, int.MaxValue);
+            try
+            {
+                if (raw.Length < 188 * 4) return;
+                var tables = ParseTables(raw);
+                var signature = tables == null ? st.Signature : Signature(raw, tables);
+                var formatChanged = false;
+                if (tables != null && (signature != st.Signature || st.DefaultFormat))
+                {
+                    var streams = FfprobeStreams(path);
+                    if (streams != null)
+                    {
+                        ApplyTables(st, tables);
+                        var material = Material(st, streams);
+                        if (material != st.Material || st.DefaultFormat)
+                        {
+                            formatChanged = true;
+                            Log(st.Source, "Puente: el formato del origen cambia: " + Describe(streams));
+                            st.Format = streams;
+                            st.Material = material;
+                            st.DefaultFormat = false;
+                            st.FrameDur = FrameDuration(streams);
+                            var probe = Path.Combine(st.BaseDir, "probe" + (++st.ProbeCount).ToString(CultureInfo.InvariantCulture) + ".ts");
+                            File.WriteAllBytes(probe, raw);
+                            Probe(st, probe, st.Token);
+                            StopEncoder(st);
+                            StartEncoder(st);
+                            // conversiones de Emby (Emby.Server.MediaEncoding): relanzar con una decisión nueva
+                            try { (AppDomain.CurrentDomain.GetData("EmbyNoShare.LiveFormatChanged") as Action<string>)?.Invoke(st.Uid); }
+                            catch (Exception e) { Log(st.Source, "Puente: aviso a las conversiones fallido: " + e.Message); }
+                        }
+                        st.Signature = signature;
+                    }
+                }
+                if (st.VideoPid < 0) return;
+                var firstDts = FirstVideoDts(raw, st.VideoPid);
+                if (firstDts == null) return;
+
+                // volver al directo si se ha acumulado demasiado margen
+                if (!formatChanged && st.OutStarted && Lead(st) > MaxLead)
+                {
+                    if (!st.Dropping) Log(st.Source, "Puente: margen de " + Lead(st).ToString("0.0", CultureInfo.InvariantCulture) + " s, se descartan trozos para volver al directo");
+                    st.Dropping = true;
+                    st.RunKind = 0;
+                    return;
+                }
+                st.Dropping = false;
+
+                StartOut(st);
+                var discontinuous = Reflect.Get(file, "IsDiscontinuity") is bool d && d;
+                var newRun = st.RunKind != 2 || st.RunRawNext == null || discontinuous
+                             || Math.Abs(Signed(firstDts.Value - st.RunRawNext.Value)) > Clock;
+                if (newRun) st.RunOffset = Mod(st.OutNextDts - firstDts.Value);
+                var output = Rewrite(st, raw, st.RunOffset, newRun, false, out var lastRaw, out var lastOut);
+                if (lastOut < 0) return;
+                long duration = 0;
+                if (Reflect.Get(file, "Duration") is TimeSpan span && span > TimeSpan.Zero) duration = (long)(span.TotalSeconds * Clock);
+                if (duration <= 0) duration = Mod(lastOut - Mod(firstDts.Value + st.RunOffset)) + st.FrameDur;
+                Publish(st, output, duration, Mod(firstDts.Value + st.RunOffset), formatChanged);
+                if (st.Bridging) Log(st.Source, "Puente: vuelve el origen" + (newRun ? " (tiempo reajustado)" : ""));
+                st.Bridging = false;
+                st.OutNextDts = Mod(lastOut + st.FrameDur);
+                st.RunRawNext = Mod(lastRaw + st.FrameDur);
+                st.RunKind = 2;
+            }
+            finally
+            {
+                TryDelete(path);
+            }
+        }
+
+        /// Un trozo de la intro: tablas del canal y tiempo seguido
+        static void PublishIntro(State st, object[] segment)
+        {
+            var data = (byte[])segment[0];
+            var firstDts = FirstVideoDts(data, st.VideoPid);
+            if (firstDts == null) return;
+            StartOut(st);
+            var newRun = st.RunKind != 1;
+            if (newRun) st.RunOffset = Mod(st.OutNextDts - firstDts.Value);
+            var output = Rewrite(st, data, st.RunOffset, newRun, true, out _, out var lastOut);
+            if (lastOut < 0) return;
+            Publish(st, output, (long)segment[2], Mod(firstDts.Value + st.RunOffset), false);
+            st.OutNextDts = Mod(lastOut + st.FrameDur);
+            st.RunKind = 1;
+        }
+
+        /// Sin vídeo: el trozo tal cual, con la numeración seguida
+        static void PublishRaw(State st, object file)
+        {
+            lock (st)
+            {
+                st.Replaying = true;
+                try
+                {
+                    Reflect.Set(file, "SequenceNumber", st.NextSeq++);
+                    Reflect.Call(st.Source, "OnSegmentStarted", file);
+                    Reflect.Call(st.Source, "OnSegmentCompleted", file);
+                    Reflect.Set(st.Source, "CurrentWritingFile", null);
+                }
+                finally { st.Replaying = false; }
+            }
+        }
+
+        static void Publish(State st, byte[] data, long duration, long firstDts, bool discontinuity)
+        {
+            lock (st)
+            {
+                var seq = st.NextSeq++;
+                var path = Path.Combine(st.BaseDir, "p" + seq.ToString("0000000", CultureInfo.InvariantCulture) + ".ts");
+                File.WriteAllBytes(path, data);
+                var info = Activator.CreateInstance(st.InfoType);
+                Reflect.Set(info, "Path", path);
+                Reflect.Set(info, "FileName", Path.GetFileName(path));
+                Reflect.Set(info, "SequenceNumber", seq);
+                Reflect.Set(info, "Duration", TimeSpan.FromSeconds(duration / (double)Clock));
+                Reflect.Set(info, "IsClosed", true);
+                Reflect.Set(info, "IsDiscontinuity", discontinuity);
+                var wall = new DateTimeOffset(st.W0, TimeSpan.Zero).AddSeconds(Mod(firstDts - st.P0) / (double)Clock);
+                Reflect.Set(info, "WallClockStartTime", (DateTimeOffset?)wall);
+                st.Replaying = true;
+                try
+                {
+                    Reflect.Call(st.Source, "OnSegmentStarted", info);
+                    Reflect.Call(st.Source, "OnSegmentCompleted", info);
+                    Reflect.Set(st.Source, "CurrentWritingFile", null);
+                }
+                finally { st.Replaying = false; }
+            }
+        }
+
+        static string LastPublishedPath(State st) =>
+            Path.Combine(st.BaseDir, "p" + (st.NextSeq - 1).ToString("0000000", CultureInfo.InvariantCulture) + ".ts");
+
+        /// Reescribe un trozo sobre la línea de tiempo publicada: PAT/PMT del canal (con versión), PTS/DTS/PCR + offset,
+        /// contadores de continuidad seguidos y, al empezar un tramo nuevo, indicador de discontinuidad en el primer PCR
+        static byte[] Rewrite(State st, byte[] input, long offset, bool newRun, bool intro, out long lastRawDts, out long lastOutDts)
+        {
+            lastRawDts = -1;
+            lastOutDts = -1;
+            var output = new MemoryStream(input.Length + 188 * 16);
+            WriteTables(st, output);
+            var markPcr = newRun;
+            var packet = new byte[188];
+            var dropping = new Dictionary<int, bool>();
+            var trimming = new HashSet<int>();          // pistas de audio aún por encajar tras el empalme
+            if (newRun) foreach (var pid in st.MediaPids) if (pid != st.VideoPid) trimming.Add(pid);
+            var lastAudio = new Dictionary<int, long>();
+            for (var p = 0; p + 188 <= input.Length; p += 188)
+            {
+                if (input[p] != 0x47) continue;
+                var pid = PidOf(input, p);
+                if (pid == 0) { WriteTables(st, output); continue; }
+                if (!st.MediaPids.Contains(pid) && pid != st.PcrPid) continue;    // tablas y SDT, relleno
+                if (intro && pid == st.IntroPmtPid) continue;
+                Buffer.BlockCopy(input, p, packet, 0, 188);
+                if ((packet[1] & 0x40) != 0 && pid == st.VideoPid)
+                {
+                    var dts = PesPts(packet, 0, true) ?? PesPts(packet, 0, false);
+                    if (dts != null) { lastRawDts = dts.Value; lastOutDts = Mod(dts.Value + offset); }
+                }
+                if ((packet[1] & 0x40) != 0)
+                {
+                    ShiftPes(packet, offset);
+                    if (pid != st.VideoPid && PesPts(packet, 0, false) is long apts)
+                    {
+                        // tras un empalme, fuera el audio que se solaparía con el ya publicado
+                        var drop = false;
+                        if (trimming.Contains(pid))
+                        {
+                            if (st.AudioNext.TryGetValue(pid, out var expected) && Signed(apts - expected) < -Clock / 100) drop = true;
+                            else trimming.Remove(pid);
+                        }
+                        dropping[pid] = drop;
+                        if (!drop)
+                        {
+                            var delta = lastAudio.TryGetValue(pid, out var previous) ? Signed(apts - previous) : 0;
+                            lastAudio[pid] = apts;
+                            if (delta > 0 && delta < Clock) st.AudioDelta[pid] = delta;
+                            st.AudioNext[pid] = Mod(apts + (st.AudioDelta.TryGetValue(pid, out var step) ? step : 1920));
+                        }
+                    }
+                }
+                if (dropping.TryGetValue(pid, out var dropNow) && dropNow) continue;
+                var pcr = ShiftPcr(packet, offset);
+                if (pcr != null && markPcr && pid == st.PcrPid) { packet[5] |= 0x80; markPcr = false; }
+                WritePacket(st, output, packet);
+                if (pcr != null && pid != st.PcrPid)
+                {
+                    WritePcr(st, output, st.PcrPid, pcr.Value, markPcr);
+                    markPcr = false;
+                }
+            }
+            return output.ToArray();
+        }
+
+        static long? FirstVideoDts(byte[] data, int videoPid)
+        {
+            for (var p = 0; p + 188 <= data.Length; p += 188)
+            {
+                if (data[p] != 0x47 || PidOf(data, p) != videoPid || (data[p + 1] & 0x40) == 0) continue;
+                var dts = PesPts(data, p, true) ?? PesPts(data, p, false);
+                if (dts != null) return dts;
+            }
+            return null;
+        }
+
+        static void WriteTables(State st, MemoryStream output)
+        {
+            foreach (var p in st.Pat) WritePacket(st, output, (byte[])p.Clone());
+            foreach (var p in st.Pmt) WritePacket(st, output, (byte[])p.Clone());
+        }
+
+        static void WritePacket(State st, MemoryStream output, byte[] packet)
+        {
+            var pid = PidOf(packet, 0);
+            var payload = (packet[3] & 0x10) != 0;
+            if (!st.Counters.TryGetValue(pid, out var counter)) counter = 15;
+            if (payload) counter = (counter + 1) & 15;
+            st.Counters[pid] = counter;
+            packet[3] = (byte)((packet[3] & 0xF0) | counter);
+            output.Write(packet, 0, 188);
+        }
+
+        /// Paquete solo con PCR (sin carga) en el PID que el canal usa para el reloj
+        static void WritePcr(State st, MemoryStream output, int pid, long pcr, bool discontinuity)
+        {
+            var b = new byte[188];
+            for (var i = 0; i < 188; i++) b[i] = 0xFF;
+            b[0] = 0x47;
+            b[1] = (byte)((pid >> 8) & 0x1F);
+            b[2] = (byte)pid;
+            b[3] = 0x20;
+            b[4] = 183;
+            b[5] = (byte)(discontinuity ? 0x90 : 0x10);
+            b[6] = (byte)(pcr >> 25);
+            b[7] = (byte)(pcr >> 17);
+            b[8] = (byte)(pcr >> 9);
+            b[9] = (byte)(pcr >> 1);
+            b[10] = (byte)(((pcr & 1) << 7) | 0x7E);
+            b[11] = 0;
+            WritePacket(st, output, b);
+        }
+
+        // ---------------------------------------------------------------------------------------------------------
+        // Secciones PSI
+
+        static byte[] Section(byte[][] packets)
+        {
+            var section = new MemoryStream();
+            for (var i = 0; i < packets.Length; i++)
+            {
+                var o = PayloadOffset(packets[i], 0);
+                if (o < 0) continue;
+                if (i == 0) o += 1 + packets[i][o];
+                if (o < 188) section.Write(packets[i], o, 188 - o);
+            }
+            var s = section.ToArray();
+            if (s.Length < 3) return s;
+            var total = 3 + (((s[1] & 0x0F) << 8) | s[2]);
+            if (total < s.Length) Array.Resize(ref s, total);
+            return s;
+        }
+
+        static string SectionBody(byte[][] packets)
+        {
+            var s = Section(packets);
+            var b = new StringBuilder();
+            for (var i = 0; i < s.Length - 4; i++) if (i != 5) b.Append(s[i].ToString("x2", CultureInfo.InvariantCulture));
+            return b.ToString();
+        }
+
+        static int SectionVersion(byte[][] packets)
+        {
+            var s = Section(packets);
+            return s.Length > 5 ? (s[5] >> 1) & 31 : 0;
+        }
+
+        /// Pone la versión en la sección repartida entre los paquetes y recalcula su CRC
+        static void SetSectionVersion(byte[][] packets, int version)
+        {
+            var s = Section(packets);
+            if (s.Length < 12) return;
+            s[5] = (byte)((s[5] & 0xC1) | ((version & 31) << 1));
+            var crc = Crc32(s, s.Length - 4);
+            s[s.Length - 4] = (byte)(crc >> 24);
+            s[s.Length - 3] = (byte)(crc >> 16);
+            s[s.Length - 2] = (byte)(crc >> 8);
+            s[s.Length - 1] = (byte)crc;
+            var k = 0;
+            for (var i = 0; i < packets.Length && k < s.Length; i++)
+            {
+                var o = PayloadOffset(packets[i], 0);
+                if (o < 0) continue;
+                if (i == 0) o += 1 + packets[i][o];
+                for (; o < 188 && k < s.Length; o++, k++) packets[i][o] = s[k];
+            }
+        }
+
+        static uint Crc32(byte[] data, int length)
+        {
+            uint crc = 0xFFFFFFFF;
+            for (var i = 0; i < length; i++)
+            {
+                crc ^= (uint)data[i] << 24;
+                for (var bit = 0; bit < 8; bit++) crc = (crc & 0x80000000) != 0 ? (crc << 1) ^ 0x04C11DB7 : crc << 1;
+            }
+            return crc;
+        }
+
+        // ---------------------------------------------------------------------------------------------------------
+        // Intro
+
+        static void StartEncoder(State st)
+        {
+            if (st.Format == null || st.VideoPid < 0) return;
+            var args = EncoderArguments(st, st.Format, st.Intro);
+            if (args == null)
+            {
+                Log(st.Source, "Puente: no hay codificador para la intro en este formato; sin intro hasta que cambie");
+                st.Enc = null;
+                st.NextEncoderStart = DateTime.MaxValue;
+                return;
+            }
+            var enc = new Encoder();
+            try
+            {
+                var info = new ProcessStartInfo(Tool("ffmpeg"), args)
+                {
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true,
+                    WorkingDirectory = AppDir(),
+                };
+                Log(st.Source, "Puente: intro con ffmpeg " + args);
+                enc.Process = Process.Start(info);
+                enc.Process.ErrorDataReceived += (sender, e) =>
+                {
+                    if (string.IsNullOrEmpty(e.Data)) return;
+                    lock (enc.Queue) enc.Error = (enc.Error + " " + e.Data).Length > 2000 ? e.Data : enc.Error + " " + e.Data;
+                };
+                enc.Process.BeginErrorReadLine();
+                var videoPid = st.VideoPid;
+                var token = st.Token;
+                var reader = new Thread(() => ReadEncoder(enc, videoPid, token)) { IsBackground = true, Name = "EmbyNoShare intro ffmpeg" };
+                reader.Start();
+                st.Enc = enc;
+                st.NextEncoderStart = DateTime.UtcNow.AddSeconds(5);
+            }
+            catch (Exception e)
+            {
+                enc.Error = e.Message;
+                enc.Done = true;
+                st.Enc = enc;
+            }
+        }
+
+        static void StopEncoder(State st)
+        {
+            var enc = st.Enc;
+            st.Enc = null;
+            if (enc == null) return;
+            try { if (enc.Process != null && !enc.Process.HasExited) enc.Process.Kill(); } catch { }
+            lock (enc.Queue)
+            {
+                enc.Done = true;
+                Monitor.PulseAll(enc.Queue);
+            }
+        }
+
+        /// Corta la salida de ffmpeg en trozos que empiezan en un fotograma clave cada SegmentSeconds:
+        /// {byte[] datos, long PTS inicial, long duración}
+        static void ReadEncoder(Encoder enc, int videoPid, CancellationToken token)
+        {
+            var stream = enc.Process.StandardOutput.BaseStream;
+            var buffer = new byte[188 * 1024];
+            var filled = 0;
+            MemoryStream current = null;
+            long currentStart = 0;
+            try
+            {
+                while (!token.IsCancellationRequested && !enc.Done)
+                {
+                    var n = stream.Read(buffer, filled, buffer.Length - filled);
+                    if (n <= 0) break;
+                    filled += n;
+                    var p = 0;
+                    for (; p + 188 <= filled; p += 188)
+                    {
+                        if (buffer[p] != 0x47)
+                        {
+                            var next = Array.IndexOf(buffer, (byte)0x47, p + 1, filled - p - 1);
+                            if (next < 0) { p = filled; break; }
+                            p = next - 188;
+                            continue;
+                        }
+                        if (PidOf(buffer, p) == videoPid && (buffer[p + 1] & 0x40) != 0 && RandomAccess(buffer, p))
+                        {
+                            var pts = PesPts(buffer, p, false);
+                            if (pts != null)
+                            {
+                                if (current != null && Mod(pts.Value - currentStart) >= SegmentSeconds * Clock - Clock / 30)
+                                {
+                                    Enqueue(enc, new object[] { current.ToArray(), currentStart, Mod(pts.Value - currentStart) }, token);
+                                    current = null;
+                                }
+                                if (current == null) { current = new MemoryStream(); currentStart = pts.Value; }
+                            }
+                        }
+                        current?.Write(buffer, p, 188);
+                    }
+                    var rest = filled - p;
+                    if (rest > 0) Buffer.BlockCopy(buffer, p, buffer, 0, rest);
+                    filled = Math.Max(0, rest);
+                }
+            }
+            catch { }
+            lock (enc.Queue)
+            {
+                enc.Done = true;
+                Monitor.PulseAll(enc.Queue);
+            }
+        }
+
+        static void Enqueue(Encoder enc, object segment, CancellationToken token)
+        {
+            lock (enc.Queue)
+            {
+                while (enc.Queue.Count >= EncodedAhead && !token.IsCancellationRequested && !enc.Done)
+                    Monitor.Wait(enc.Queue, 500);
+                enc.Queue.Enqueue(segment);
+                Monitor.PulseAll(enc.Queue);
+            }
+        }
+
+        static object TakeEncoded(Encoder enc, int timeoutMs)
+        {
+            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
+            lock (enc.Queue)
+            {
+                while (enc.Queue.Count == 0)
+                {
+                    if (enc.Done) return null;
+                    var left = (int)(deadline - DateTime.UtcNow).TotalMilliseconds;
+                    if (left <= 0) return null;
+                    Monitor.Wait(enc.Queue, Math.Min(left, 500));
+                }
+                var segment = enc.Queue.Dequeue();
+                Monitor.PulseAll(enc.Queue);
+                return segment;
+            }
         }
 
         // ---------------------------------------------------------------------------------------------------------
@@ -542,10 +1550,13 @@ namespace EmbyNoShare.Runtime
             st.IntroPmtPid = 0x1FF0;
             while (st.MediaPids.Contains(st.IntroPmtPid) || st.IntroPmtPid == st.PmtPid || st.IntroPmtPid == st.PcrPid) st.IntroPmtPid--;
 
-            var image = IsImage(intro);
+            var image = intro == null || IsImage(intro);
             var introAudio = !image && HasAudio(intro);
             var b = new StringBuilder("-hide_banner -nostdin -loglevel error ");
-            b.Append(image ? "-loop 1 -framerate " + fps + " " : "-stream_loop -1 ").Append("-i ").Append(Quote(intro));
+            if (intro == null)
+                b.Append("-f lavfi -i ").Append(Quote(string.Format(CultureInfo.InvariantCulture, "color=c=black:s={0}x{1}:r={2}", width, height, fps)));
+            else
+                b.Append(image ? "-loop 1 -framerate " + fps + " " : "-stream_loop -1 ").Append("-i ").Append(Quote(intro));
             if (audios.Count > 0 && !introAudio) b.Append(" -f lavfi -i anullsrc=r=48000:cl=stereo");
             b.Append(" -map 0:v:0");
             foreach (var _ in audios) b.Append(introAudio ? " -map 0:a:0" : " -map 1:a:0");
@@ -583,415 +1594,6 @@ namespace EmbyNoShare.Runtime
             return audio;
         }
 
-        static bool StartEncoder(State st, string args)
-        {
-            try
-            {
-                var info = new ProcessStartInfo(Tool("ffmpeg"), args)
-                {
-                    UseShellExecute = false,
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    RedirectStandardInput = false,
-                    CreateNoWindow = true,
-                    WorkingDirectory = AppDir(),
-                };
-                Log(st.Source, "Intro: ffmpeg " + args);
-                var process = Process.Start(info);
-                st.Encoder = process;
-                process.ErrorDataReceived += (sender, e) =>
-                {
-                    if (string.IsNullOrEmpty(e.Data)) return;
-                    lock (st.Encoded) st.EncoderError = (st.EncoderError + " " + e.Data).Length > 2000 ? e.Data : st.EncoderError + " " + e.Data;
-                };
-                process.BeginErrorReadLine();
-                var reader = new Thread(() => ReadEncoder(st, process)) { IsBackground = true, Name = "EmbyNoShare intro ffmpeg" };
-                reader.Start();
-                return true;
-            }
-            catch (Exception e)
-            {
-                st.EncoderError = e.Message;
-                return false;
-            }
-        }
-
-        static void StopEncoder(State st)
-        {
-            var process = st.Encoder;
-            if (process == null) return;
-            try { if (!process.HasExited) process.Kill(); } catch { }
-            lock (st.Encoded) Monitor.PulseAll(st.Encoded);
-        }
-
-        /// Corta la salida de ffmpeg en trozos que empiezan en un fotograma clave cada SegmentSeconds
-        static void ReadEncoder(State st, Process process)
-        {
-            var stream = process.StandardOutput.BaseStream;
-            var buffer = new byte[188 * 1024];
-            var filled = 0;
-            MemoryStream current = null;
-            long currentStart = 0;
-            try
-            {
-                while (!st.Token.IsCancellationRequested)
-                {
-                    var n = stream.Read(buffer, filled, buffer.Length - filled);
-                    if (n <= 0) break;
-                    filled += n;
-                    var p = 0;
-                    for (; p + 188 <= filled; p += 188)
-                    {
-                        if (buffer[p] != 0x47)
-                        {
-                            // resincronizar
-                            var next = Array.IndexOf(buffer, (byte)0x47, p + 1, filled - p - 1);
-                            if (next < 0) { p = filled; break; }
-                            p = next - 188;
-                            continue;
-                        }
-                        if (PidOf(buffer, p) == st.VideoPid && (buffer[p + 1] & 0x40) != 0 && RandomAccess(buffer, p))
-                        {
-                            var pts = PesPts(buffer, p, false);
-                            if (pts != null)
-                            {
-                                if (current != null && Mod(pts.Value - currentStart) >= SegmentSeconds * Clock - Clock / 30)
-                                {
-                                    Enqueue(st, new object[] { current.ToArray(), currentStart, Mod(pts.Value - currentStart) });
-                                    current = null;
-                                }
-                                if (current == null) { current = new MemoryStream(); currentStart = pts.Value; }
-                            }
-                        }
-                        current?.Write(buffer, p, 188);
-                    }
-                    var rest = filled - p;
-                    if (rest > 0) Buffer.BlockCopy(buffer, p, buffer, 0, rest);
-                    filled = Math.Max(0, rest);
-                }
-            }
-            catch { }
-            lock (st.Encoded)
-            {
-                st.EncoderDone = true;
-                Monitor.PulseAll(st.Encoded);
-            }
-        }
-
-        static void Enqueue(State st, object segment)
-        {
-            lock (st.Encoded)
-            {
-                while (st.Encoded.Count >= EncodedAhead && !st.Token.IsCancellationRequested && !st.EncoderDone)
-                    Monitor.Wait(st.Encoded, 500);
-                st.Encoded.Enqueue(segment);
-                Monitor.PulseAll(st.Encoded);
-            }
-        }
-
-        static object TakeEncoded(State st, int timeoutMs)
-        {
-            var deadline = DateTime.UtcNow.AddMilliseconds(timeoutMs);
-            lock (st.Encoded)
-            {
-                while (st.Encoded.Count == 0)
-                {
-                    if (st.EncoderDone || st.Token.IsCancellationRequested) return null;
-                    var left = (int)(deadline - DateTime.UtcNow).TotalMilliseconds;
-                    if (left <= 0) return null;
-                    Monitor.Wait(st.Encoded, Math.Min(left, 500));
-                }
-                var segment = st.Encoded.Dequeue();
-                Monitor.PulseAll(st.Encoded);
-                return segment;
-            }
-        }
-
-        // ---------------------------------------------------------------------------------------------------------
-        // Emisión
-
-        /// Mientras no haya un trozo del canal que empiece después del final de la intro, más intro al ritmo del canal;
-        /// cuando lo hay, la intro se recorta justo ahí y se publica el canal
-        static void Feed(State st, long end)
-        {
-            var lastLatest = (long?)null;
-            var lastProgress = DateTime.UtcNow;
-            try
-            {
-                while (!st.Token.IsCancellationRequested)
-                {
-                    var target = FindStart(st, end);
-                    if (target != null)
-                    {
-                        var index = (int)target[0];
-                        var pts = (long)target[1];
-                        var dts = (long)target[2];
-                        var audioStarts = (Dictionary<int, long>)target[3];
-                        // cubrir con intro hasta el instante del canal (hasta medio fotograma)
-                        while (Mod(pts - end) > Clock / 100 && Mod(pts - end) < Wrap / 2)
-                        {
-                            var segment = (object[])TakeEncoded(st, 5000);
-                            if (segment == null) break;
-                            var duration = (long)segment[2];
-                            if (Mod(end + duration - pts) < Wrap / 2 && Mod(end + duration - pts) > 0)
-                            {
-                                PublishIntro(st, Emit(st, (byte[])segment[0], dts, pts, audioStarts), Mod(pts - end));
-                                end = pts;
-                                break;
-                            }
-                            PublishIntro(st, Emit(st, (byte[])segment[0], null, null), duration);
-                            end = Mod(end + duration);
-                        }
-                        Switch(st, index, true);
-                        Log(st.Source, "Intro: cambio al canal en el instante " + (pts / (double)Clock).ToString("0.000", CultureInfo.InvariantCulture)
-                                       + " s (intro hasta " + (end / (double)Clock).ToString("0.000", CultureInfo.InvariantCulture) + " s)");
-                        return;
-                    }
-
-                    // los trozos del canal anteriores al final de la intro ya no se van a publicar
-                    lock (st)
-                        while (st.Held.Count > 2 && st.Done.Contains(st.Held[0]))
-                        {
-                            try { File.Delete(Reflect.Get(st.Held[0], "Path") as string); } catch { }
-                            st.Done.Remove(st.Held[0]);
-                            st.Held.RemoveAt(0);
-                        }
-
-                    var latest = LatestPts(st);
-                    if (latest != null && latest != lastLatest) { lastLatest = latest; lastProgress = DateTime.UtcNow; }
-                    if ((DateTime.UtcNow - lastProgress).TotalSeconds > 60)
-                    {
-                        Log(st.Source, "Intro: el canal no envía nada desde hace 60 s, se cierra");
-                        Close(st);
-                        return;
-                    }
-                    // más intro solo cuando el canal ya ha llegado al final de la emitida
-                    if (latest != null && Mod(latest.Value - end) < Wrap / 2)
-                    {
-                        var segment = (object[])TakeEncoded(st, 0);
-                        if (segment != null)
-                        {
-                            PublishIntro(st, Emit(st, (byte[])segment[0], null, null), (long)segment[2]);
-                            end = Mod(end + (long)segment[2]);
-                        }
-                        else if (st.EncoderDone)
-                        {
-                            Log(st.Source, "Intro: ffmpeg terminó (" + st.EncoderError.Trim() + "), se pasa al canal");
-                            int last;
-                            lock (st) last = Math.Max(0, st.Held.Count - 1);
-                            Switch(st, last, true);
-                            return;
-                        }
-                    }
-                    Thread.Sleep(100);
-                }
-            }
-            catch (Exception e)
-            {
-                Log(st.Source, "Intro: error, se pasa al canal: " + e);
-                try { if (!st.Switched) Switch(st, 0, true); } catch { }
-            }
-            finally
-            {
-                StopEncoder(st);
-            }
-        }
-
-        /// Primer trozo retenido del canal cuyo fotograma clave inicial va en `end` o después:
-        /// {índice, PTS, DTS, primer PTS de cada pista de audio}
-        static object[] FindStart(State st, long end)
-        {
-            var files = new List<object>();
-            lock (st) files.AddRange(st.Held);
-            for (var i = 0; i < files.Count; i++)
-            {
-                var path = Reflect.Get(files[i], "Path") as string;
-                var data = ReadShared(path, 0, 512 * 1024);
-                for (var p = 0; p + 188 <= data.Length; p += 188)
-                {
-                    if (data[p] != 0x47 || PidOf(data, p) != st.VideoPid || (data[p + 1] & 0x40) == 0) continue;
-                    var pts = PesPts(data, p, false);
-                    if (pts == null) break;
-                    var dts = PesPts(data, p, true) ?? pts.Value;
-                    if (Mod(pts.Value - end) >= Wrap / 2) break;
-                    var audio = new Dictionary<int, long>();
-                    for (var q = 0; q + 188 <= data.Length; q += 188)
-                    {
-                        var pid = PidOf(data, q);
-                        if (data[q] != 0x47 || pid == st.VideoPid || !st.MediaPids.Contains(pid) || (data[q + 1] & 0x40) == 0
-                            || audio.ContainsKey(pid)) continue;
-                        var a = PesPts(data, q, false);
-                        if (a != null) audio[pid] = a.Value;
-                    }
-                    return new object[] { i, pts.Value, dts, audio };
-                }
-            }
-            return null;
-        }
-
-        /// Mayor PTS de vídeo recibido del canal (final del último trozo retenido)
-        static long? LatestPts(State st)
-        {
-            string path;
-            lock (st) path = st.Held.Count == 0 ? null : Reflect.Get(st.Held[st.Held.Count - 1], "Path") as string;
-            if (path == null) return null;
-            long length;
-            try { length = new FileInfo(path).Length; } catch { return null; }
-            var offset = Math.Max(0, length - 1024 * 1024);
-            offset -= offset % 188;
-            var data = ReadShared(path, offset, 1024 * 1024);
-            long? latest = null;
-            for (var p = 0; p + 188 <= data.Length; p += 188)
-            {
-                if (data[p] != 0x47 || PidOf(data, p) != st.VideoPid || (data[p + 1] & 0x40) == 0) continue;
-                var pts = PesPts(data, p, false);
-                if (pts != null && (latest == null || Mod(pts.Value - latest.Value) < Wrap / 2)) latest = pts;
-            }
-            return latest;
-        }
-
-        /// Un trozo de la intro listo para el buffer: tabla de pistas del canal, marcas de tiempo desplazadas y contadores
-        /// de continuidad seguidos. Con corte, se descarta el vídeo desde `cutDts` (orden de decodificación) y cada audio
-        /// desde donde empieza el del canal (`audioStarts`, o `cutPts`).
-        static byte[] Emit(State st, byte[] input, long? cutDts, long? cutPts, Dictionary<int, long> audioStarts = null)
-        {
-            var output = new MemoryStream(input.Length + 188 * 16);
-            WriteTables(st, output);
-            var dropping = new Dictionary<int, bool>();
-            var packet = new byte[188];
-            for (var p = 0; p + 188 <= input.Length; p += 188)
-            {
-                if (input[p] != 0x47) continue;
-                var pid = PidOf(input, p);
-                if (pid == 0) { WriteTables(st, output); continue; }
-                if (!st.MediaPids.Contains(pid)) continue;     // tabla y SDT de la intro, relleno
-                Buffer.BlockCopy(input, p, packet, 0, 188);
-                if ((packet[1] & 0x40) != 0)
-                {
-                    ShiftPes(packet, st.Shift);
-                    if (cutPts != null)
-                    {
-                        var pts = PesPts(packet, 0, false);
-                        var dts = PesPts(packet, 0, true) ?? pts;
-                        if (pts != null)
-                            dropping[pid] = pid == st.VideoPid
-                                ? Mod(dts.Value - cutDts.Value) < Wrap / 2
-                                : Mod(pts.Value - (audioStarts != null && audioStarts.TryGetValue(pid, out var a) ? a : cutPts.Value)) < Wrap / 2;
-                    }
-                }
-                if (dropping.TryGetValue(pid, out var drop) && drop) continue;
-                var pcr = ShiftPcr(packet, st.Shift);
-                WritePacket(st, output, packet);
-                if (pcr != null && pid != st.PcrPid) WritePcr(st, output, st.PcrPid, pcr.Value);
-            }
-            return output.ToArray();
-        }
-
-        static void WriteTables(State st, MemoryStream output)
-        {
-            foreach (var p in st.Pat) WritePacket(st, output, (byte[])p.Clone());
-            foreach (var p in st.Pmt) WritePacket(st, output, (byte[])p.Clone());
-        }
-
-        static void WritePacket(State st, MemoryStream output, byte[] packet)
-        {
-            var pid = PidOf(packet, 0);
-            var payload = (packet[3] & 0x10) != 0;
-            if (!st.Counters.TryGetValue(pid, out var counter)) counter = 15;
-            if (payload) counter = (counter + 1) & 15;
-            st.Counters[pid] = counter;
-            packet[3] = (byte)((packet[3] & 0xF0) | counter);
-            output.Write(packet, 0, 188);
-        }
-
-        /// Paquete solo con PCR (sin carga) en el PID que el canal usa para el reloj
-        static void WritePcr(State st, MemoryStream output, int pid, long pcr)
-        {
-            var b = new byte[188];
-            for (var i = 0; i < 188; i++) b[i] = 0xFF;
-            b[0] = 0x47;
-            b[1] = (byte)((pid >> 8) & 0x1F);
-            b[2] = (byte)pid;
-            b[3] = 0x20;
-            b[4] = 183;
-            b[5] = 0x10;
-            var bas = pcr;
-            b[6] = (byte)(bas >> 25);
-            b[7] = (byte)(bas >> 17);
-            b[8] = (byte)(bas >> 9);
-            b[9] = (byte)(bas >> 1);
-            b[10] = (byte)(((bas & 1) << 7) | 0x7E);
-            b[11] = 0;
-            WritePacket(st, output, b);
-        }
-
-        static void PublishIntro(State st, byte[] data, long duration)
-        {
-            lock (st)
-            {
-                var seq = st.NextSeq++;
-                var path = Path.Combine(st.Dir, "intro_" + seq.ToString("0000000", CultureInfo.InvariantCulture) + ".ts");
-                File.WriteAllBytes(path, data);
-                var info = Activator.CreateInstance(st.InfoType);
-                Reflect.Set(info, "Path", path);
-                Reflect.Set(info, "FileName", Path.GetFileName(path));
-                Reflect.Set(info, "SequenceNumber", seq);
-                Reflect.Set(info, "Duration", TimeSpan.FromSeconds(duration / (double)Clock));
-                Reflect.Set(info, "IsClosed", true);
-                Reflect.Set(info, "WallClockStartTime", (DateTimeOffset?)DateTimeOffset.UtcNow);
-                st.Replaying = true;
-                try
-                {
-                    Reflect.Call(st.Source, "OnSegmentStarted", info);
-                    Reflect.Call(st.Source, "OnSegmentCompleted", info);
-                    Reflect.Set(st.Source, "CurrentWritingFile", null);
-                }
-                finally { st.Replaying = false; }
-            }
-        }
-
-        /// Publica los trozos retenidos del canal desde `from` (los anteriores se borran) y deja pasar los siguientes
-        static void Switch(State st, int from, bool discontinuity)
-        {
-            lock (st)
-            {
-                if (st.Switched) return;
-                st.Replaying = true;
-                try
-                {
-                    object last = null;
-                    for (var i = 0; i < st.Held.Count; i++)
-                    {
-                        var file = st.Held[i];
-                        if (i < from)
-                        {
-                            try { File.Delete(Reflect.Get(file, "Path") as string); } catch { }
-                            continue;
-                        }
-                        Reflect.Set(file, "SequenceNumber", st.NextSeq++);
-                        if (discontinuity && i == from) Reflect.Set(file, "IsDiscontinuity", true);
-                        Reflect.Call(st.Source, "OnSegmentStarted", file);
-                        if (st.Done.Contains(file)) Reflect.Call(st.Source, "OnSegmentCompleted", file);
-                        last = file;
-                    }
-                    if (last == null || st.Done.Contains(last)) Reflect.Set(st.Source, "CurrentWritingFile", null);
-                    st.LastSeq = st.NextSeq - 1;
-                    st.Switched = true;
-                    st.Held.Clear();
-                    st.Done.Clear();
-                }
-                finally { st.Replaying = false; }
-            }
-        }
-
-        static void Close(State st)
-        {
-            try { Reflect.Call(st.Source, "EmbyNoShare_CloseIdle"); }
-            catch
-            {
-                try { ((CancellationTokenSource)Reflect.Get(st.Source, "LiveStreamCancellationTokenSource")).Cancel(); } catch { }
-            }
-        }
 
         // ---------------------------------------------------------------------------------------------------------
         // MPEG-TS
@@ -1063,6 +1665,20 @@ namespace EmbyNoShare.Runtime
         }
 
         static long Mod(long v) => ((v % Wrap) + Wrap) % Wrap;
+
+        static long Signed(long v)
+        {
+            v = Mod(v);
+            return v >= Wrap / 2 ? v - Wrap : v;
+        }
+
+        static string Sanitize(string url)
+        {
+            if (string.IsNullOrEmpty(url)) return url;
+            var q = url.IndexOf('?');
+            return q >= 0 ? url.Substring(0, q) + "?…" : url;
+        }
+
 
         // ---------------------------------------------------------------------------------------------------------
         // ffprobe / ffmpeg de Emby

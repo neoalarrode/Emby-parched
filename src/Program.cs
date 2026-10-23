@@ -85,15 +85,21 @@
 //     ya convertido, continúa la numeración de segmentos y añade #EXT-X-DISCONTINUITY. EMBY_LIVE_RESTART=0 lo
 //     desactiva. La lógica está en runtime/ (LiveRestart, LiveInput), que se copia dentro de las DLL.
 //
-//   live-intro (Emby.LiveTV.dll, EmbyNoShare.LiveIntro): con EMBY_LIVE_INTRO (ruta de un vídeo o imagen), abrir un
-//     canal MPEG-TS ya no espera a llenar el buffer. En cuanto llegan la tabla de pistas y el primer fotograma clave,
-//     Emby analiza ese trozo y responde con el formato real, y su ffmpeg codifica la intro en ese mismo formato
-//     (códec, parámetros, PID y tabla de pistas del canal) y la mete en el buffer, con marcas de tiempo seguidas,
-//     hasta que el canal tiene un trozo en ese instante; entonces se recorta la intro y sigue el canal sin cortes.
-//     SharedHttpPipelineSource: OpenInternal, OnSegmentStarted y OnSegmentCompleted (runtime/LiveIntro).
+//   live-intro (Emby.LiveTV.dll, EmbyNoShare.LiveIntro): puente entre el origen de un canal y sus lectores
+//     (runtime/LiveIntro). Abrir un canal ya no espera a llenar el buffer: en cuanto llega el formato del origen, Emby
+//     responde y emite una intro (EMBY_LIVE_INTRO, vídeo o imagen; si no, negro) codificada por su ffmpeg en ese
+//     mismo formato. Los trozos del origen se publican completos y reescritos sobre una línea de tiempo continua; si el
+//     origen se retrasa o se corta entra la intro, y si deja de mandar datos o falla el procesador se abre otra
+//     conexión sin cerrar el canal. Orígenes HLS u otros contenedores entran por ffmpeg sin recodificar. Los cambios de
+//     formato a mitad de directo se detectan: Emby vuelve a analizar, la intro se regenera y las conversiones se
+//     relanzan con una decisión nueva (live-hls-restart). EMBY_LIVE_BRIDGE=0 lo desactiva.
+//     SharedHttpPipelineSource: OpenInternal, OpenStream, OnSegmentStarted, OnSegmentCompleted y el cierre del
+//     directo cuando falla el procesador.
 //
 // Uso: EmbyNoShare <ruta/Emby.LiveTV.dll | ruta/Emby.Server.MediaEncoding.dll | ruta/plugin.dll | ...> [--check]
-//   --check: 0 = hay parches pendientes y todos los patrones coinciden, 3 = nada que hacer
+//   --check: 0 = hay parches pendientes y todos los patrones coinciden, 3 = nada que hacer,
+//            4 = la DLL lleva código de apoyo de otra versión (hay que partir de la original)
+//   --info: version=<versión de la DLL> patched=<0|1> stale=<0|1>
 using Mono.Cecil;
 using Mono.Cecil.Cil;
 using Mono.Cecil.Rocks;
@@ -111,6 +117,23 @@ resolver.AddSearchDirectory(Path.GetDirectoryName(path)!);
 
 using var asm = AssemblyDefinition.ReadAssembly(path, new ReaderParameters { AssemblyResolver = resolver, InMemory = true });
 var module = asm.MainModule;
+
+// El código de apoyo (runtime/) se copia en la DLL una sola vez. Si la DLL ya lleva el de otra compilación, no se
+// puede mezclar ni actualizar encima: hay que partir de la DLL original (aplicar-parche.sh lo hace con su copia).
+var patchedBefore = module.Types.Any(t => t.Namespace == "EmbyNoShare");
+var runtimeMarker = "Runtime_" + Injector.Hash();
+var staleRuntime = module.Types.Any(t => t.Namespace == "EmbyNoShare.Runtime")
+                   && !module.Types.Any(t => t.Namespace == "EmbyNoShare" && t.Name == runtimeMarker);
+if (args.Contains("--info"))
+{
+    Console.WriteLine($"version={asm.Name.Version} patched={(patchedBefore ? 1 : 0)} stale={(staleRuntime ? 1 : 0)}");
+    return 0;
+}
+if (staleRuntime)
+{
+    Console.Error.WriteLine($"{path} lleva el código de apoyo de otra versión del parcheador: hay que partir de la DLL original.");
+    return 4;
+}
 
 var patches = new (string Assembly, string Marker, string Name, Func<ModuleDefinition, Action?> Prepare)[]
 {
@@ -177,6 +200,8 @@ foreach (var (marker, name, apply) in pending)
     Console.WriteLine($"[{name}] aplicado");
 }
 
+if (module.Types.Any(t => t.Namespace == "EmbyNoShare.Runtime") && !module.Types.Any(t => t.Namespace == "EmbyNoShare" && t.Name == runtimeMarker))
+    module.Types.Add(new TypeDefinition("EmbyNoShare", runtimeMarker, TypeAttributes.NotPublic | TypeAttributes.Abstract | TypeAttributes.Sealed, module.TypeSystem.Object));
 asm.Write(path);
 Console.WriteLine("Parche aplicado: " + path);
 return 0;
@@ -1518,13 +1543,48 @@ static Action? PrepareLiveIntro(ModuleDefinition module)
         if (!module.GetType(pipe).Methods.Any(m => m.Name == member)) throw new Exception("No se encuentra SharedHttpPipelineSource." + member);
     foreach (var member in new[] { "_supportsCopyTo", "BufferLimit", "TempFilePath", "CompletedSegmentFiles", "CurrentWritingFile", "_config", "_appHost" })
         if (!module.GetType(pipe).Fields.Any(f => f.Name == member)) throw new Exception("No se encuentra SharedHttpPipelineSource." + member);
-    Console.WriteLine($"[live-intro] {open.FullName}, {started.FullName}, {completed.FullName}");
+    var openStream = FindMethod(module, pipe, "OpenStream", 6);
+    if (openStream.Parameters[3].ParameterType.Name != "MediaProtocol" || openStream.Parameters[4].ParameterType.FullName != "System.Threading.CancellationToken"
+        || !openStream.ReturnType.FullName.StartsWith("System.Threading.Tasks.Task`1"))
+        throw new Exception("Firma inesperada de SharedHttpPipelineSource.OpenStream");
+    // Continuaciones que cierran todo el directo si falla el procesador del origen
+    var failures = new List<(MethodDefinition Method, Instruction Load, Instruction Cancel)>();
+    foreach (var type in AllNested(module.GetType(pipe)))
+        foreach (var m in type.Methods.Where(m => m.HasBody))
+        {
+            var ins = m.Body.Instructions;
+            if (!ins.Any(i => i.OpCode == OpCodes.Ldstr && (i.Operand as string) is "Error in DecodingGraphRunner" or "Error in RunAsyncFixTimings")) continue;
+            for (var i = 0; i + 1 < ins.Count; i++)
+                if (ins[i].OpCode == OpCodes.Ldfld && ins[i].Operand is FieldReference f && f.Name == "LiveStreamCancellationTokenSource"
+                    && ins[i + 1].OpCode == OpCodes.Callvirt && ins[i + 1].Operand is MethodReference c && c.Name == "Cancel" && c.Parameters.Count == 0)
+                    failures.Add((m, ins[i], ins[i + 1]));
+        }
+    if (failures.Count == 0) throw new Exception("No se encuentra el cierre del directo cuando falla el procesador del origen");
+    Console.WriteLine($"[live-intro] {open.FullName}, {started.FullName}, {completed.FullName}, {openStream.FullName}, {failures.Count} cierres por fallo");
 
     return () =>
     {
         var rt = Injector.Ensure(module, "LiveIntro");
         var openHook = Injector.Method(rt, "Open", 2);
         var hold = Injector.Method(rt, "Hold", 3);
+        var streamHook = Injector.Method(rt, "OpenStream", 5);
+        var failed = Injector.Method(rt, "PipelineFailed", 1);
+
+        // OpenStream: var t = LiveIntro.OpenStream(this, context, mediaSource, url, ct); if (t != null) return (Task<OpenStreamResult>)t;
+        var ps = openStream.Body.GetILProcessor();
+        var popStream = ps.Create(OpCodes.Pop);
+        Prologue(openStream, ps.Create(OpCodes.Ldarg_0), ps.Create(OpCodes.Ldarg_1), ps.Create(OpCodes.Ldarg_2), ps.Create(OpCodes.Ldarg_3),
+            ps.Create(OpCodes.Ldarg_S, openStream.Parameters[4]), ps.Create(OpCodes.Call, streamHook), ps.Create(OpCodes.Dup),
+            ps.Create(OpCodes.Brfalse, popStream), ps.Create(OpCodes.Castclass, openStream.ReturnType), ps.Create(OpCodes.Ret), popStream);
+
+        // <this>.LiveStreamCancellationTokenSource.Cancel() -> LiveIntro.PipelineFailed(<this>)
+        foreach (var (method, load, cancel) in failures)
+        {
+            load.OpCode = OpCodes.Call;
+            load.Operand = failed;
+            cancel.OpCode = OpCodes.Nop;
+            cancel.Operand = null;
+        }
 
         // OpenInternal: var t = LiveIntro.Open(this, ct); if (t != null) return t;
         var p = open.Body.GetILProcessor();
@@ -1542,4 +1602,13 @@ static Action? PrepareLiveIntro(ModuleDefinition module)
                 q.Create(OpCodes.Call, hold), q.Create(OpCodes.Brfalse, first), q.Create(OpCodes.Ret));
         }
     };
+}
+
+static IEnumerable<TypeDefinition> AllNested(TypeDefinition type)
+{
+    foreach (var n in type.NestedTypes)
+    {
+        yield return n;
+        foreach (var m in AllNested(n)) yield return m;
+    }
 }
