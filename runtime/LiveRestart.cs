@@ -152,19 +152,31 @@ namespace EmbyNoShare.Runtime
             if (!(Reflect.Call(liveStream, "GetSegments") is IList segments)) return;
             object best = null;
             double bestStart = 0;
+            var files = new List<string>();
             foreach (var segment in segments)
             {
                 var file = Reflect.Get(segment, "Path") as string;
                 var pts = FirstPts(file);
                 if (pts == null) continue;
+                files.Add(file);
                 if (pts.Value <= target + 0.001 && (best == null || pts.Value >= bestStart)) { best = segment; bestStart = pts.Value; }
             }
             if (best == null) return;
+            // Copiando, ffmpeg recorta por el instante de decodificación (DTS), que en el fotograma clave donde hay que
+            // seguir va antes que su imagen (fotogramas B, entrelazado): con el de imagen se descartaba ese fotograma y
+            // se saltaba un GOP entero. Transcodificando recorta por la imagen (PTS) y vale el instante de la imagen.
+            var cut = target - 0.05;
+            if (string.Equals(Reflect.Get(state, "OutputVideoCodec") as string, "copy", StringComparison.OrdinalIgnoreCase))
+            {
+                var at = files.IndexOf(Reflect.Get(best, "Path") as string);
+                double? dts = null;
+                for (var i = Math.Max(0, at); i < files.Count && i <= at + 2 && dts == null; i++) dts = KeyframeDts(files[i], target);
+                if (dts != null) cut = dts.Value - 0.001;
+            }
             var uniqueId = Reflect.Get(liveStream, "UniqueId") as string;
             if (string.IsNullOrEmpty(uniqueId)) return;
             AppDomain.CurrentDomain.SetData(LiveInput.Key + uniqueId, Reflect.Get(best, "SequenceNumber"));
-            // copiando, ffmpeg empieza en el primer fotograma clave a partir de -ss: un pelín antes del objetivo
-            pending.Seek = Math.Max(0, target - bestStart - 0.05);
+            pending.Seek = Math.Max(0, cut - bestStart);
         }
 
         /// "start: 3.021333" de la línea Duration del log de ffmpeg: instante inicial de su entrada
@@ -184,6 +196,37 @@ namespace EmbyNoShare.Runtime
             }
             return null;
         }
+
+        /// DTS (o PTS si no lleva) del PES de vídeo cuya imagen (PTS) cae en `pts` (±30 ms), en segundos
+        static double? KeyframeDts(string file, double pts)
+        {
+            if (string.IsNullOrEmpty(file) || !File.Exists(file)) return null;
+            byte[] data;
+            using (var stream = new FileStream(file, FileMode.Open, FileAccess.Read, FileShare.ReadWrite | FileShare.Delete))
+            {
+                data = new byte[Math.Min(stream.Length, 64L * 1024 * 1024)];
+                var read = 0;
+                while (read < data.Length) { var n = stream.Read(data, read, data.Length - read); if (n <= 0) break; read += n; }
+            }
+            for (var p = 0; p + 188 <= data.Length; p += 188)
+            {
+                if (data[p] != 0x47 || (data[p + 1] & 0x40) == 0) continue;
+                var afc = (data[p + 3] >> 4) & 3;
+                var o = p + 4;
+                if ((afc & 2) != 0) o += 1 + data[p + 4];
+                if ((afc & 1) == 0 || o + 19 > p + 188) continue;
+                if (data[o] != 0 || data[o + 1] != 0 || data[o + 2] != 1 || (data[o + 3] & 0xF0) != 0xE0) continue;
+                var flags = data[o + 7] >> 6;
+                if ((flags & 2) == 0) continue;
+                var framePts = ReadTs(data, o + 9) / 90000.0;
+                if (Math.Abs(framePts - pts) > 0.03) continue;
+                return (flags == 3 ? ReadTs(data, o + 14) : ReadTs(data, o + 9)) / 90000.0;
+            }
+            return null;
+        }
+
+        static long ReadTs(byte[] b, int o) =>
+            ((long)(b[o] >> 1) & 7) << 30 | (long)b[o + 1] << 22 | (long)(b[o + 2] >> 1) << 15 | (long)b[o + 3] << 7 | (long)(b[o + 4] >> 1);
 
         /// Menor PTS de los primeros PES de un trozo MPEG-TS del buffer, en segundos
         internal static double? FirstPts(string file)
