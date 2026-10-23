@@ -1006,7 +1006,7 @@ namespace EmbyNoShare.Runtime
             // puente: más intro si a los lectores se les va a acabar lo publicado y, con el origen ya en marcha, si además
             // lleva un rato sin mandar nada (si manda, su trozo está al llegar)
             var lead = Lead(st);
-            var sourceRunning = st.RunKind == 2 && (DateTime.UtcNow - st.LastActivity).TotalSeconds < Math.Max(BridgeIdle, 1.5 * st.BurstGap);
+            var sourceRunning = st.RunKind == 2 && Late(st, (DateTime.UtcNow - st.LastActivity).TotalSeconds) < Math.Max(BridgeIdle, 1.5 * st.BurstGap);
             if (st.OutStarted && lead < LowLead && !sourceRunning)
             {
                 // lo que ya llegó del trozo a medias va antes que la intro
@@ -1106,22 +1106,23 @@ namespace EmbyNoShare.Runtime
             return copy;
         }
 
-        /// Segundos de contenido que el origen lleva mandados por delante del tiempo real en esta conexión
-        static double Ahead(State st)
+        /// Segundos que el origen va con retraso: el menor entre lo que lleva sin mandar nada y lo que va por detrás del
+        /// tiempo real respecto al contenido recibido en esta conexión (negativo si va por delante, p. ej. tras una ráfaga)
+        static double Late(State st, double idle)
         {
-            if (st.GenFirstPts == null || st.GenLastPts == null) return 0;
+            if (st.GenFirstPts == null || st.GenLastPts == null) return idle;
             var content = Mod(st.GenLastPts.Value - st.GenFirstPts.Value) / (double)Clock;
-            if (content > 3600) return 0;
-            return Math.Max(0, content - (DateTime.UtcNow - st.GenFirstData).TotalSeconds);
+            if (content > 3600) return idle;
+            return Math.Min(idle, (DateTime.UtcNow - st.GenFirstData).TotalSeconds - content);
         }
 
         static void CheckStall(State st)
         {
             if (st.GenStarting || DateTime.UtcNow < st.NextGenRestart) return;
             var idle = (DateTime.UtcNow - st.LastActivity).TotalSeconds;
-            // tras un intento fallido, el siguiente a los 3 s; si no, el umbral cuenta también lo que el origen ha mandado por
-            // delante del tiempo real (una ráfaga de 12 s permite 12 s sin datos)
-            if (idle < (st.GenFailures > 0 ? 3 : Math.Max(Stall, 3 * st.BurstGap + 2) + Ahead(st))) return;
+            // tras un intento fallido, el siguiente a los 3 s; si no, cuenta lo que el origen va con retraso respecto a lo que
+            // ya ha mandado (tras una ráfaga de 12 s no va tarde hasta pasados esos 12 s)
+            if (st.GenFailures > 0 ? idle < 3 : Late(st, idle) < Math.Max(Stall, 3 * st.BurstGap + 2)) return;
             Log(st.Source, "Puente: " + ((int)idle).ToString(CultureInfo.InvariantCulture) + " s sin datos del origen, se abre otra conexión");
             RestartGen(st, 0);
         }
@@ -1222,7 +1223,11 @@ namespace EmbyNoShare.Runtime
                 st.OutNextDts = Mod(lastOut + st.FrameDur);
                 st.RunRawNext = Mod(lastRaw + st.FrameDur);
                 st.RunKind = 2;
-                if (st.GenFirstPts == null) { st.GenFirstPts = firstDts.Value; st.GenFirstData = DateTime.UtcNow; }
+                if (st.GenFirstPts == null)
+                {
+                    st.GenFirstPts = firstDts.Value;
+                    st.GenFirstData = DateTime.UtcNow.AddSeconds(-duration / (double)Clock);
+                }
                 st.GenLastPts = Mod(lastRaw + st.FrameDur);
             }
             finally
