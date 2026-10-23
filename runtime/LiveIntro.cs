@@ -38,7 +38,8 @@ namespace EmbyNoShare.Runtime
         const long Clock = 90000;
         const long Wrap = 1L << 33;
         const int SegmentSeconds = 3;
-        const int EncodedAhead = 3;             // trozos de intro codificados por delante como máximo
+        const int IntroSegmentSeconds = 1;      // la intro va en trozos cortos: el origen entra en cuanto tiene el suyo
+        const int EncodedAhead = 6;             // trozos de intro codificados por delante como máximo
         const double LowLead = 1.0;             // s de margen publicado por debajo de los cuales entra la intro
         const double MaxLead = 25;              // s de margen por encima de los cuales se descartan trozos (volver al directo)
         const double Stall = 10;                // s sin datos del origen para abrir otra conexión
@@ -106,6 +107,7 @@ namespace EmbyNoShare.Runtime
             // audio publicado: siguiente PTS esperado por pista (para no solapar al empezar un tramo)
             public readonly Dictionary<int, long> AudioNext = new Dictionary<int, long>();
             public readonly Dictionary<int, long> AudioDelta = new Dictionary<int, long>();
+            public readonly Dictionary<int, long> AudioLast = new Dictionary<int, long>();
 
             // intro
             public Encoder Enc;
@@ -458,6 +460,8 @@ namespace EmbyNoShare.Runtime
             }
             if (old != null) Task.Delay(15000).ContinueWith(_ => { try { Directory.Delete(old.Dir, true); } catch { } });
 
+            // tras un fallo, antes de pedírselo a Emby (que registra cada error con su traza), ¿acepta conexiones?
+            if (st.GenFailures > 0) Reachable(st.Remuxed ? st.RemuxUrl : st.OriginalUrl);
             object result;
             if (!st.Detected) result = OpenFirst(st, gen.Cts.Token);
             else
@@ -479,6 +483,16 @@ namespace EmbyNoShare.Runtime
                     tcs.Task.Wait(15000);
                 }
                 finally { Reflect.Set(st.Source, "TempFilePath", st.BasePattern); }
+            }
+        }
+
+        static void Reachable(string url)
+        {
+            if (!Uri.TryCreate(url, UriKind.Absolute, out var uri) || (uri.Scheme != "http" && uri.Scheme != "https")) return;
+            using (var client = new System.Net.Sockets.TcpClient())
+            {
+                var connect = client.ConnectAsync(uri.Host, uri.Port);
+                if (!connect.Wait(2000) || !client.Connected) throw new Exception("el origen no acepta conexiones");
             }
         }
 
@@ -510,12 +524,12 @@ namespace EmbyNoShare.Runtime
                 catch (Exception e)
                 {
                     st.GenFailures++;
-                    if (!st.Token.IsCancellationRequested)
+                    if (!st.Token.IsCancellationRequested && (st.GenFailures <= 3 || st.GenFailures % 20 == 0))
                         Log(st.Source, "Puente: no se pudo conectar con el origen (" + st.GenFailures.ToString(CultureInfo.InvariantCulture) + "): " + Inner(e).Message);
                 }
                 finally
                 {
-                    st.NextGenRestart = DateTime.UtcNow.AddSeconds(Math.Min(30, 5 * Math.Max(1, st.GenFailures)));
+                    st.NextGenRestart = DateTime.UtcNow.AddSeconds(st.GenFailures == 0 ? 0 : 3);
                     lock (st) { st.GenStarting = false; st.LastActivity = DateTime.UtcNow; }
                 }
             });
@@ -559,10 +573,10 @@ namespace EmbyNoShare.Runtime
                 if (streams != null)
                     foreach (var s in streams)
                         if (Str(s, "codec_type") == "video" && double.TryParse(Str(s, "duration"), NumberStyles.Float, CultureInfo.InvariantCulture, out var d)) duration = d;
-                seconds = (int)Math.Max(6, Math.Min(30, Math.Round(duration / SegmentSeconds) * SegmentSeconds));
+                seconds = (int)Math.Max(6, Math.Min(30, Math.Round(duration)));
             }
             // un trozo de más: el último que corta ffmpeg queda incompleto y no se usa
-            var args = EncoderArguments(st, st.Format, st.Intro, seconds + SegmentSeconds);
+            var args = EncoderArguments(st, st.Format, st.Intro, seconds + IntroSegmentSeconds);
             var key = args + "|" + (st.Intro == null ? "" : File.GetLastWriteTimeUtc(st.Intro).Ticks + "|" + new FileInfo(st.Intro).Length);
             string hash;
             using (var sha = System.Security.Cryptography.SHA1.Create())
@@ -1024,7 +1038,8 @@ namespace EmbyNoShare.Runtime
                             if (changed)
                             {
                                 formatChanged = true;
-                                // conversiones de Emby (Emby.Server.MediaEncoding): relanzar con una decisión nueva
+                                // conversiones de Emby (Emby.Server.MediaEncoding): relanzar con una decisión nueva, desde este trozo
+                                AppDomain.CurrentDomain.SetData("EmbyNoShare.FormatSeq." + st.Uid, st.NextSeq);
                                 try { (AppDomain.CurrentDomain.GetData("EmbyNoShare.LiveFormatChanged") as Action<string>)?.Invoke(st.Uid); }
                                 catch (Exception e) { Log(st.Source, "Puente: aviso a las conversiones fallido: " + e.Message); }
                             }
@@ -1033,6 +1048,9 @@ namespace EmbyNoShare.Runtime
                     st.Signature = signature;
                 }
                 if (st.VideoPid < 0) return;
+                object following;
+                lock (st) following = st.Held.Count > 0 ? st.Held[0] : null;
+                if (following != null) raw = WithBorrowedAudio(st, raw, ReadShared(Reflect.Get(following, "Path") as string, 0, 1024 * 1024));
                 var firstDts = FirstVideoDts(raw, st.VideoPid);
                 if (firstDts == null) return;
 
@@ -1072,7 +1090,7 @@ namespace EmbyNoShare.Runtime
         /// Un trozo de la intro: tablas del canal y tiempo seguido
         static void PublishIntro(State st, object[] segment)
         {
-            var data = (byte[])segment[0];
+            var data = WithBorrowedAudio(st, (byte[])segment[0], PeekIntro(st));
             var firstDts = FirstVideoDts(data, st.VideoPid);
             if (firstDts == null) return;
             StartOut(st);
@@ -1172,11 +1190,15 @@ namespace EmbyNoShare.Runtime
                             if (st.AudioNext.TryGetValue(pid, out var expected) && Signed(apts - expected) < -Clock / 100) drop = true;
                             else trimming.Remove(pid);
                         }
+                        // ya publicado (prestado al trozo anterior para no dejar hueco)
+                        if (!drop && st.AudioLast.TryGetValue(pid, out var published) && Signed(apts - published) <= 0 && Signed(apts - published) > -2 * Clock)
+                            drop = true;
                         dropping[pid] = drop;
                         if (!drop)
                         {
                             var delta = lastAudio.TryGetValue(pid, out var previous) ? Signed(apts - previous) : 0;
                             lastAudio[pid] = apts;
+                            st.AudioLast[pid] = apts;
                             if (delta > 0 && delta < Clock) st.AudioDelta[pid] = delta;
                             st.AudioNext[pid] = Mod(apts + (st.AudioDelta.TryGetValue(pid, out var step) ? step : 1920));
                         }
@@ -1193,6 +1215,61 @@ namespace EmbyNoShare.Runtime
                 }
             }
             return output.ToArray();
+        }
+
+        /// El siguiente trozo de intro que se publicaría (sin sacarlo)
+        static byte[] PeekIntro(State st)
+        {
+            if (st.DefaultFormat && st.Cached != null) return (byte[])((object[])st.Cached[st.CachedNext % st.Cached.Length])[0];
+            var enc = st.Enc;
+            if (enc == null) return null;
+            lock (enc.Queue) return enc.Queue.Count > 0 ? (byte[])((object[])enc.Queue.Peek())[0] : null;
+        }
+
+        /// El audio que el multiplexor dejó en el trozo siguiente pero suena antes de su primer fotograma se añade a este,
+        /// para no dejar hueco si después no va ese trozo (empalme); cuando sí va, el duplicado se descarta al reescribir
+        static byte[] WithBorrowedAudio(State st, byte[] data, byte[] next)
+        {
+            if (next == null || next.Length < 188) return data;
+            var nextVideo = FirstVideoPts(next, st.VideoPid);
+            var thisVideo = FirstVideoPts(data, st.VideoPid);
+            if (nextVideo == null || thisVideo == null) return data;
+            var gap = Signed(nextVideo.Value - thisVideo.Value);
+            if (gap <= 0 || gap > 30 * Clock) return data;        // no es el trozo que sigue (bucle de la intro, otra conexión)
+            var output = new MemoryStream();
+            var pending = new Dictionary<int, MemoryStream>();
+            var closed = new HashSet<int>();
+            for (var p = 0; p + 188 <= next.Length; p += 188)
+            {
+                if (next[p] != 0x47) continue;
+                var pid = PidOf(next, p);
+                if (pid == st.VideoPid || !st.MediaPids.Contains(pid) || closed.Contains(pid)) continue;
+                if ((next[p + 1] & 0x40) != 0)
+                {
+                    // el PES anterior de esta pista ya está completo
+                    if (pending.TryGetValue(pid, out var done)) { done.WriteTo(output); pending.Remove(pid); }
+                    var pts = PesPts(next, p, false);
+                    if (pts == null || Signed(pts.Value - nextVideo.Value) >= 0) { closed.Add(pid); continue; }
+                    pending[pid] = new MemoryStream();
+                }
+                if (pending.TryGetValue(pid, out var current)) current.Write(next, p, 188);
+            }
+            if (output.Length == 0) return data;
+            var combined = new byte[data.Length - data.Length % 188 + output.Length];
+            Buffer.BlockCopy(data, 0, combined, 0, data.Length - data.Length % 188);
+            output.ToArray().CopyTo(combined, data.Length - data.Length % 188);
+            return combined;
+        }
+
+        static long? FirstVideoPts(byte[] data, int videoPid)
+        {
+            for (var p = 0; p + 188 <= data.Length; p += 188)
+            {
+                if (data[p] != 0x47 || PidOf(data, p) != videoPid || (data[p + 1] & 0x40) == 0) continue;
+                var pts = PesPts(data, p, false);
+                if (pts != null) return pts;
+            }
+            return null;
         }
 
         static long? FirstVideoDts(byte[] data, int videoPid)
@@ -1376,7 +1453,7 @@ namespace EmbyNoShare.Runtime
             }
         }
 
-        /// Corta la salida de ffmpeg en trozos que empiezan en un fotograma clave cada SegmentSeconds:
+        /// Corta la salida de ffmpeg en trozos que empiezan en un fotograma clave cada IntroSegmentSeconds:
         /// {byte[] datos, long PTS inicial, long duración}
         static void ReadEncoder(Encoder enc, int videoPid, CancellationToken token)
         {
@@ -1407,7 +1484,7 @@ namespace EmbyNoShare.Runtime
                             var pts = PesPts(buffer, p, false);
                             if (pts != null)
                             {
-                                if (current != null && Mod(pts.Value - currentStart) >= SegmentSeconds * Clock - Clock / 30)
+                                if (current != null && Mod(pts.Value - currentStart) >= IntroSegmentSeconds * Clock - Clock / 30)
                                 {
                                     Enqueue(enc, new object[] { current.ToArray(), currentStart, Mod(pts.Value - currentStart) }, token);
                                     current = null;
@@ -1506,7 +1583,7 @@ namespace EmbyNoShare.Runtime
             var interlaced = field == "tt" || field == "tb" || field == "bb" || field == "bt";
             var topFirst = field == "tt" || field == "tb";
             var bframes = Int(v, "has_b_frames");
-            var gop = Math.Max(1, (int)Math.Round(SegmentSeconds * Fps(fps)));
+            var gop = Math.Max(1, (int)Math.Round(IntroSegmentSeconds * Fps(fps)));
             var sar = Str(v, "sample_aspect_ratio");
             int sarNum = 1, sarDen = 1;
             if (sar != null)
@@ -1566,7 +1643,7 @@ namespace EmbyNoShare.Runtime
             b.Append(" -map 0:v:0");
             foreach (var _ in audios) b.Append(introAudio ? " -map 0:a:0" : " -map 1:a:0");
             b.Append(" -vf ").Append(Quote(filter)).Append(' ').Append(encoder);
-            b.Append(" -force_key_frames ").Append(Quote("expr:gte(t,n_forced*" + SegmentSeconds + ")"));
+            b.Append(" -force_key_frames ").Append(Quote("expr:gte(t,n_forced*" + IntroSegmentSeconds + ")"));
             // huecos del audio de la intro (p. ej. más corto que el vídeo, en cada vuelta) rellenos con silencio
             if (audios.Count > 0) b.Append(" -af aresample=async=1:first_pts=0");
             foreach (var a in audios) b.Append(a);

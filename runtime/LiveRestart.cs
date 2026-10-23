@@ -113,7 +113,16 @@ namespace EmbyNoShare.Runtime
                     if (index + 1 > next) { next = index + 1; end = (Reflect.Get(info, "EndSeconds") as double?) ?? end; }
                 }
                 var pending = new Pending { Next = next };
-                if (next > 0) Position(service, runner, job, state, end, pending);
+                // cambio de formato: desde el primer trozo del formato nuevo (lo anterior ya está convertido con la
+                // decisión de antes); si no, desde donde se quedó la conversión
+                bool formatChange;
+                lock (Sync) formatChange = Redecisions.Contains(state);
+                int? formatSeq = null;
+                var liveStream = Reflect.Get(state, "LiveStream");
+                var uniqueId = liveStream == null ? null : Reflect.Get(liveStream, "UniqueId") as string;
+                if (formatChange && uniqueId != null && AppDomain.CurrentDomain.GetData("EmbyNoShare.FormatSeq." + uniqueId) is int seq) formatSeq = seq;
+                if (formatSeq != null) AppDomain.CurrentDomain.SetData(LiveInput.Key + uniqueId, formatSeq.Value);
+                else if (next > 0) Position(service, runner, job, state, end, pending);
                 lock (Sync)
                 {
                     Pendings[state] = pending;
@@ -136,6 +145,7 @@ namespace EmbyNoShare.Runtime
                 Reflect.Set(newJob, "StartingSegmentIndex", (int?)next);
                 RemoveJob(Reflect.Get(service, "EncodingManager"), job);
                 Log(job, "Relanzar conversión: relanzada desde el segmento " + next.ToString(CultureInfo.InvariantCulture)
+                         + (formatSeq != null ? ", leyendo desde el trozo " + formatSeq.Value.ToString(CultureInfo.InvariantCulture) + " (formato nuevo)" : "")
                          + (pending.Seek.HasValue ? ", saltando " + pending.Seek.Value.ToString("0.000", CultureInfo.InvariantCulture) + " s ya convertidos" : ""));
             }
             catch (Exception e)
