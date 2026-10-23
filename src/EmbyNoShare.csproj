@@ -11,4 +11,11 @@
     <PackageReference Include="Mono.Cecil" Version="0.11.6" />
   </ItemGroup>
 
+  <!-- Código que se copia dentro de Emby (ver runtime/): se compila antes y va incrustado en el parcheador -->
+  <ItemGroup>
+    <ProjectReference Include="../runtime/EmbyNoShare.Runtime.csproj" ReferenceOutputAssembly="false"
+                      GlobalPropertiesToRemove="RuntimeIdentifier;SelfContained;PublishSingleFile;PublishTrimmed;TrimMode" />
+    <EmbeddedResource Include="../runtime/bin/out/EmbyNoShare.Runtime.dll" LogicalName="EmbyNoShare.Runtime.dll" />
+  </ItemGroup>
+
 </Project>

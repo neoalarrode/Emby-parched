@@ -1,0 +1,19 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Código que el parcheador copia dentro de las DLL de Emby (EmbyNoShare.Runtime.*).
+       Solo usa la biblioteca estándar: a Emby se accede por reflexión, para no depender de sus DLL al compilar.
+       Sin genéricos propios, async ni tipos anidados con interfaces: el clonador copia tipos y métodos sencillos. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Nullable>disable</Nullable>
+    <AssemblyName>EmbyNoShare.Runtime</AssemblyName>
+    <RootNamespace>EmbyNoShare.Runtime</RootNamespace>
+    <Optimize>true</Optimize>
+    <DebugType>none</DebugType>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <!-- Salida fija: el parcheador la incrusta como recurso, compile como compile (también al publicar por RID) -->
+    <OutputPath>bin/out/</OutputPath>
+    <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+    <AppendRuntimeIdentifierToOutputPath>false</AppendRuntimeIdentifierToOutputPath>
+  </PropertyGroup>
+</Project>

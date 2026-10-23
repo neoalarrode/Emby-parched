@@ -78,6 +78,13 @@
 //     segmentos. Ahora solo lista los últimos EMBY_LIVE_HLS_WINDOW_MINUTES (por defecto 30; 0 = original), sin
 //     EVENT y con MEDIA-SEQUENCE igual a los segmentos descartados, y borra del disco los que salen de la ventana.
 //
+//   live-hls-restart (Emby.Server.MediaEncoding.dll, EmbyNoShare.LiveHlsRestart) y live-start-at (Emby.LiveTV.dll,
+//   EmbyNoShare.LiveStartAt): si el ffmpeg de una conversión HLS de Live TV muere solo (p. ej. QuickSync ante un
+//     cambio de formato a mitad de la emisión), Emby dejaba la lista congelada y el cliente en negro. Se relanza al
+//     momento con el mismo estado de la reproducción: lee el buffer del canal desde el trozo donde murió y descarta lo
+//     ya convertido, continúa la numeración de segmentos y añade #EXT-X-DISCONTINUITY. EMBY_LIVE_RESTART=0 lo
+//     desactiva. La lógica está en runtime/ (LiveRestart, LiveInput), que se copia dentro de las DLL.
+//
 // Uso: EmbyNoShare <ruta/Emby.LiveTV.dll | ruta/Emby.Server.MediaEncoding.dll | ruta/plugin.dll | ...> [--check]
 //   --check: 0 = hay parches pendientes y todos los patrones coinciden, 3 = nada que hacer
 using Mono.Cecil;
@@ -113,6 +120,8 @@ var patches = new (string Assembly, string Marker, string Name, Func<ModuleDefin
     ("Emby.LiveTV", "LiveIdleClose", "live-idle-close", PrepareLiveIdleClose),
     ("Emby.LiveTV", "LiveReconnectFactor", "live-reconnect-factor", PrepareLiveReconnectFactor),
     ("Emby.Server.MediaEncoding", "LiveHlsWindow", "live-hls-window", PrepareLiveHlsWindow),
+    ("Emby.Server.MediaEncoding", "LiveHlsRestart", "live-hls-restart", PrepareLiveHlsRestart),
+    ("Emby.LiveTV", "LiveStartAt", "live-start-at", PrepareLiveStartAt),
 };
 
 var applicable = patches.Where(x => x.Assembly == asm.Name.Name).ToList();
@@ -1393,4 +1402,97 @@ static VariableDefinition? StoredLocal(MethodDefinition method, Instruction ins)
     if (ins.OpCode == OpCodes.Stloc_2) return vars[2];
     if (ins.OpCode == OpCodes.Stloc_3) return vars[3];
     return ins.Operand as VariableDefinition;
+}
+
+// Sustituye cada "ret" de un método por: <instrucciones> + ret. Se reutiliza la propia instrucción ret para que los
+// saltos que apuntaban a ella pasen por lo añadido.
+static void BeforeEachRet(MethodDefinition method, Func<ILProcessor, Instruction[]> build)
+{
+    var p = method.Body.GetILProcessor();
+    foreach (var ret in method.Body.Instructions.Where(i => i.OpCode == OpCodes.Ret).ToList())
+    {
+        var added = build(p);
+        ret.OpCode = added[0].OpCode;
+        ret.Operand = added[0].Operand;
+        var anchor = ret;
+        foreach (var ins in added.Skip(1).Append(p.Create(OpCodes.Ret)))
+        {
+            p.InsertAfter(anchor, ins);
+            anchor = ins;
+        }
+    }
+}
+
+// Inserta instrucciones al principio del método (los saltos al antiguo comienzo no pasan por ellas)
+static void Prologue(MethodDefinition method, params Instruction[] added)
+{
+    var p = method.Body.GetILProcessor();
+    var first = method.Body.Instructions[0];
+    foreach (var ins in added) p.InsertBefore(first, ins);
+}
+
+static MethodDefinition FindMethod(ModuleDefinition module, string typeName, string name, int parameters)
+{
+    var type = module.GetType(typeName) ?? throw new Exception("No se encuentra " + typeName);
+    var found = type.Methods.Where(m => m.Name == name && m.Parameters.Count == parameters && m.HasBody).ToList();
+    if (found.Count != 1) throw new Exception($"Se esperaba 1 {typeName}.{name} con {parameters} parámetros, hay {found.Count}");
+    return found[0];
+}
+
+static Action? PrepareLiveHlsRestart(ModuleDefinition module)
+{
+    var exited = FindMethod(module, "Emby.Server.MediaEncoding.Api.BaseStreamingService", "OnFfMpegProcessExited", 3);
+    var startNumber = FindMethod(module, "Emby.Server.MediaEncoding.Api.Hls.BaseHlsService", "GetStartNumber", 1);
+    var playlist = FindMethod(module, "Emby.Server.MediaEncoding.Api.Hls.BaseHlsService", "GetLivePlaylistText", 4);
+    var command = FindMethod(module, "Emby.Server.MediaEncoding.Api.Hls.VideoHlsService", "GetCommandLineArguments", 2);
+    if (startNumber.ReturnType.FullName != "System.Int32" || playlist.ReturnType.FullName != "System.String"
+        || playlist.Parameters[1].ParameterType.Name != "TranscodingJob" || command.Parameters[1].ParameterType.Name != "StreamState"
+        || exited.Parameters[1].ParameterType.Name != "TranscodingJob" || exited.Parameters[2].ParameterType.Name != "StreamState")
+        throw new Exception("Firmas inesperadas en la conversión HLS");
+    Console.WriteLine($"[live-hls-restart] {exited.FullName}");
+    Console.WriteLine($"[live-hls-restart] {startNumber.FullName}, {playlist.FullName}, {command.FullName}");
+
+    return () =>
+    {
+        var rt = Injector.Ensure(module, "LiveRestart");
+        var onExited = Injector.Method(rt, "OnExited", 4);
+        var number = Injector.Method(rt, "StartNumber", 2);
+        var text = Injector.Method(rt, "Playlist", 2);
+        var adjust = Injector.Method(rt, "AdjustCommand", 2);
+
+        // OnFfMpegProcessExited: if (LiveRestart.OnExited(this, runner, job, state)) return;
+        var p = exited.Body.GetILProcessor();
+        var original = exited.Body.Instructions[0];
+        Prologue(exited, p.Create(OpCodes.Ldarg_0), p.Create(OpCodes.Ldarg_1), p.Create(OpCodes.Ldarg_2), p.Create(OpCodes.Ldarg_3),
+            p.Create(OpCodes.Call, onExited), p.Create(OpCodes.Brfalse, original), p.Create(OpCodes.Ret));
+
+        // GetStartNumber: return LiveRestart.StartNumber(<original>, state);
+        BeforeEachRet(startNumber, q => new[] { q.Create(OpCodes.Ldarg_1), q.Create(OpCodes.Call, number) });
+        // GetLivePlaylistText: return LiveRestart.Playlist(<original>, transcodingJob);
+        BeforeEachRet(playlist, q => new[] { q.Create(OpCodes.Ldarg_2), q.Create(OpCodes.Call, text) });
+        // GetCommandLineArguments: return (FfmpegCommand)LiveRestart.AdjustCommand(<original>, state);
+        BeforeEachRet(command, q => new[] { q.Create(OpCodes.Ldarg_2), q.Create(OpCodes.Call, adjust), q.Create(OpCodes.Castclass, command.ReturnType) });
+    };
+}
+
+static Action? PrepareLiveStartAt(ModuleDefinition module)
+{
+    var getSegment = FindMethod(module, "Emby.LiveTV.TunerHosts.LiveStream", "GetSegment", 1);
+    var files = FindMethod(module, "Emby.LiveTV.TunerHosts.LiveStream", "GetStreamFiles", 0);
+    if (getSegment.Parameters[0].ParameterType.FullName != "System.DateTimeOffset")
+        throw new Exception("Firma inesperada de LiveStream.GetSegment");
+    Console.WriteLine($"[live-start-at] {getSegment.FullName}");
+
+    return () =>
+    {
+        var rt = Injector.Ensure(module, "LiveInput");
+        var pick = Injector.Method(rt, "PickSegment", 2);
+        // var s = LiveInput.PickSegment(GetStreamFiles(), this); if (s != null) return (SegmentedStreamSegmentInfo)s;
+        var p = getSegment.Body.GetILProcessor();
+        var original = getSegment.Body.Instructions[0];
+        var pop = p.Create(OpCodes.Pop);
+        Prologue(getSegment, p.Create(OpCodes.Ldarg_0), p.Create(OpCodes.Callvirt, files), p.Create(OpCodes.Ldarg_0),
+            p.Create(OpCodes.Call, pick), p.Create(OpCodes.Dup), p.Create(OpCodes.Brfalse, pop),
+            p.Create(OpCodes.Castclass, getSegment.ReturnType), p.Create(OpCodes.Ret), pop);
+    };
 }
