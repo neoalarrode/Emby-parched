@@ -21,6 +21,10 @@
 //   - Apertura al momento: Emby responde ya con la intro en formato estándar (H.264 1080p25 + AAC), codificada una
 //     vez y guardada en su caché; el origen se conecta aparte y, cuando llega, su formato entra como un cambio de
 //     formato más (si es distinto del de la intro).
+//   - Normalización (por defecto; EMBY_LIVE_NORMALIZE=0 la quita): el origen pasa siempre por el ffmpeg de Emby y sale
+//     en el formato fijo de la intro (H.264 1080p desentrelazado + AAC estéreo, PID fijos), a 25 imágenes por segundo o
+//     más si el origen trae más (50 en 1080i/50p). Así intro, canal, cortes y cambios del origen tienen siempre el mismo
+//     formato. Codifica la gráfica Intel (QuickSync/VAAPI) si Emby la tiene activada en sus ajustes; si falla, la CPU.
 // EMBY_LIVE_BRIDGE=0 lo desactiva. EMBY_LIVE_INTRO: vídeo o imagen de la intro (si no, negro con silencio).
 using System;
 using System.Collections.Generic;
@@ -82,7 +86,10 @@ namespace EmbyNoShare.Runtime
             // origen
             public string OriginalUrl, RemuxUrl, RemuxMap;
             public object OriginalProtocol;
-            public bool Remuxed;                 // entra por el ffmpeg de Emby (HLS u otro contenedor)
+            public bool Remuxed;                 // entra por el ffmpeg de Emby (HLS u otro contenedor, o normalizado)
+            public bool Normalize;               // el origen se convierte siempre al formato fijo (el de la intro)
+            public double TargetFps = 25;        // imágenes por segundo del formato fijo: 25, o más si el origen trae más
+            public string Hw = "";               // codificador por hardware del formato fijo: "", "qsv" o "vaapi"
             public bool Detected;                // ya se sabe si entra directo o por ffmpeg
             public Gen Gen;
             public int GenCount, GenFailures;
@@ -244,6 +251,8 @@ namespace EmbyNoShare.Runtime
             try
             {
                 Prepare(st);
+                st.Normalize = Environment.GetEnvironmentVariable("EMBY_LIVE_NORMALIZE") != "0";
+                if (st.Normalize) st.Hw = HardwareEncoder(st);
                 // al momento: la intro en formato estándar (preparada una vez y guardada); el origen se conecta aparte
                 st.Format = DefaultFormat(st);
                 st.DefaultFormat = true;
@@ -321,7 +330,7 @@ namespace EmbyNoShare.Runtime
             var responseUrl = Reflect.Get(result, "ResponseUrl") as string ?? st.OriginalUrl;
             var hls = IsHlsUrl(st.OriginalUrl) || IsHlsUrl(responseUrl) || contentType.IndexOf("mpegurl", StringComparison.OrdinalIgnoreCase) >= 0;
             st.Detected = true;
-            if (!hls && !IsOtherContainer(contentType)) return result;
+            if (!hls && !IsOtherContainer(contentType) && !st.Normalize) return result;
 
             st.Remuxed = true;
             st.RemuxUrl = responseUrl;
@@ -419,9 +428,14 @@ namespace EmbyNoShare.Runtime
             if (extra.Length > 0) args.Append(" -headers ").Append(Quote(extra.ToString()));
             if (st.RemuxUrl.StartsWith("http", StringComparison.OrdinalIgnoreCase) && !IsHlsUrl(st.RemuxUrl))
                 args.Append(" -reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 4");
+            var hw = st.Normalize ? st.Hw : "";
+            var device = hw.Length > 0 ? RenderDevice() : null;
+            if (hw == "qsv") args.Append(" -init_hw_device vaapi=va:").Append(device).Append(" -init_hw_device qsv=qs@va -filter_hw_device qs");
+            else if (hw == "vaapi") args.Append(" -init_hw_device vaapi=va:").Append(device).Append(" -filter_hw_device va");
             args.Append(" -i ").Append(Quote(st.RemuxUrl));
-            args.Append(' ').Append(st.RemuxMap ?? "-map 0:v? -map 0:a?");
-            args.Append(" -c copy -f mpegts pipe:1");
+            if (st.Normalize) args.Append(' ').Append(NormalizeArguments(st.TargetFps, hw));
+            else args.Append(' ').Append(st.RemuxMap ?? "-map 0:v? -map 0:a?").Append(" -c copy -f mpegts pipe:1");
+            if (st.Normalize) args.Replace("-loglevel error", "-loglevel info -nostats");
             var info = new ProcessStartInfo(Tool("ffmpeg"), args.ToString())
             {
                 UseShellExecute = false,
@@ -430,8 +444,9 @@ namespace EmbyNoShare.Runtime
                 CreateNoWindow = true,
                 WorkingDirectory = AppDir(),
             };
+            HardwareEnvironment(info);
             var process = Process.Start(info);
-            process.ErrorDataReceived += (sender, e) => { if (!string.IsNullOrEmpty(e.Data)) Log(st.Source, "Puente: ffmpeg del origen: " + e.Data); };
+            process.ErrorDataReceived += (sender, e) => { if (!string.IsNullOrEmpty(e.Data)) SourceLog(st, hw, e.Data); };
             process.BeginErrorReadLine();
             var gen = st.Gen;
             if (gen != null) lock (gen.Remux) gen.Remux.Add(process);
@@ -454,6 +469,206 @@ namespace EmbyNoShare.Runtime
                 foreach (var m in t.GetMethods(System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.DeclaredOnly))
                     if (m.Name == "OpenStream" && m.ReturnType.IsGenericType) return m.ReturnType.GetGenericArguments()[0];
             throw new MissingMethodException(source.GetType().FullName, "OpenStream");
+        }
+
+        // ---------------------------------------------------------------------------------------------------------
+        // Normalización del origen
+
+        /// Formato fijo: H.264 1080p (desentrelazado) a la cadencia indicada + AAC estéreo, PID fijos; decodifica la CPU
+        /// (aguanta cualquier cambio del origen) y codifica la gráfica si Emby la tiene activada
+        static string NormalizeArguments(double fps, string hw)
+        {
+            var rate = FpsRational(fps);
+            var gop = Math.Max(1, (int)Math.Round(fps));
+            var filter = string.Format(CultureInfo.InvariantCulture,
+                "yadif=mode={0}:deint=interlaced,fps={1},scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2,setsar=1",
+                fps > 30 ? 1 : 0, rate);
+            string video;
+            if (hw == "qsv")
+            {
+                filter += ",format=nv12,hwupload=extra_hw_frames=64";
+                video = string.Format(CultureInfo.InvariantCulture, "-c:v h264_qsv -preset veryfast -profile:v high -g {0} -bf 2 -b:v 8000k -maxrate 8000k -bufsize 16000k", gop);
+            }
+            else if (hw == "vaapi")
+            {
+                filter += ",format=nv12,hwupload";
+                video = string.Format(CultureInfo.InvariantCulture, "-c:v h264_vaapi -profile:v high -g {0} -bf 2 -b:v 8000k -maxrate 8000k -bufsize 16000k", gop);
+            }
+            else
+            {
+                filter += ",format=yuv420p";
+                video = string.Format(CultureInfo.InvariantCulture,
+                    "-c:v libx264 -preset veryfast -profile:v high -level:v 4.2 -g {0} -keyint_min {0} -sc_threshold 0 -bf 3 -b:v 8000k -maxrate 8000k -bufsize 16000k", gop);
+            }
+            var b = new StringBuilder("-map 0:v:0 -map 0:a? -vf ").Append(Quote(filter)).Append(' ').Append(video);
+            b.Append(" -af aresample=async=1:first_pts=0 -c:a aac -ar 48000 -ac 2 -b:a 192k");
+            for (var i = 0; i < 9; i++) b.Append(" -streamid ").Append(i.ToString(CultureInfo.InvariantCulture)).Append(':').Append((0x100 + i).ToString(CultureInfo.InvariantCulture));
+            b.Append(" -mpegts_pmt_start_pid 4096 -muxdelay 0 -muxpreload 0 -f mpegts pipe:1");
+            return b.ToString();
+        }
+
+        static string FpsRational(double fps)
+        {
+            if (Math.Abs(fps - 59.94) < 0.05) return "60000/1001";
+            if (Math.Abs(fps - 29.97) < 0.05) return "30000/1001";
+            if (Math.Abs(fps - 23.976) < 0.05) return "24000/1001";
+            return Math.Round(fps).ToString(CultureInfo.InvariantCulture);
+        }
+
+        static string FpsText(double fps) => fps == Math.Round(fps) ? fps.ToString(CultureInfo.InvariantCulture) : fps.ToString("0.##", CultureInfo.InvariantCulture);
+
+        /// Mensajes del ffmpeg del origen: cadencia real (si trae más de la del formato fijo, se sube), sin vídeo
+        /// (radio: sin normalizar) y fallos de la gráfica (se pasa a CPU)
+        static void SourceLog(State st, string hw, string line)
+        {
+            try
+            {
+                if (st.Normalize && line.IndexOf("Stream #0:", StringComparison.Ordinal) >= 0 && line.IndexOf("Video:", StringComparison.Ordinal) > 0)
+                {
+                    var m = System.Text.RegularExpressions.Regex.Match(line, @"(\d+(?:\.\d+)?) fps");
+                    if (m.Success && double.TryParse(m.Groups[1].Value, NumberStyles.Float, CultureInfo.InvariantCulture, out var fps))
+                    {
+                        var interlaced = System.Text.RegularExpressions.Regex.IsMatch(line, @"top first|bottom first|top coded first|bottom coded first");
+                        var motion = Math.Min(60, interlaced ? fps * 2 : fps);
+                        if (motion > st.TargetFps + 0.5)
+                        {
+                            Log(st.Source, "Puente: el origen trae " + FpsText(motion) + " imágenes por segundo" + (interlaced ? " (entrelazado)" : "")
+                                           + "; el formato fijo pasa de " + FpsText(st.TargetFps) + " a " + FpsText(motion));
+                            st.TargetFps = motion;
+                            RestartGen(st, 0);
+                        }
+                    }
+                    return;
+                }
+                var lower = line.ToLowerInvariant();
+                if (st.Normalize && lower.Contains("0:v:0") && lower.Contains("matches no streams"))
+                {
+                    Log(st.Source, "Puente: el origen no tiene vídeo; se recibe sin normalizar");
+                    st.Normalize = false;
+                    st.Detected = false;
+                    st.Remuxed = false;
+                    RestartGen(st, 0);
+                    return;
+                }
+                if (hw.Length > 0 && st.Hw == hw && (lower.Contains("device creation failed") || lower.Contains("error while opening encoder")
+                    || lower.Contains("failed to initialise") || lower.Contains("failed to initialize") || (lower.Contains("hwupload") && lower.Contains("error"))))
+                {
+                    Log(st.Source, "Puente: la gráfica (" + hw + ") falla al normalizar, se pasa a CPU: " + line);
+                    lock (HwLock) HwBrokenUntil = DateTime.UtcNow.AddMinutes(10);
+                    st.Hw = "";
+                    RestartGen(st, 0);
+                    return;
+                }
+                if (lower.Contains("error") || lower.Contains("invalid") || lower.Contains("failed")) Log(st.Source, "Puente: ffmpeg del origen: " + line);
+            }
+            catch { }
+        }
+
+        static readonly object HwLock = new object();
+        static DateTime HwCheckedAt = DateTime.MinValue, HwBrokenUntil = DateTime.MinValue;
+        static string HwCached = "";
+
+        /// Codificador por hardware para el formato fijo según los ajustes de transcodificación de Emby: desactivado ->
+        /// CPU; personalizado -> los H.264 QuickSync/VAAPI que tenga activados, por prioridad; automático -> QuickSync y si
+        /// no VAAPI. Cada uno se prueba con una codificación corta antes de usarlo.
+        static string HardwareEncoder(State st)
+        {
+            lock (HwLock)
+            {
+                if (DateTime.UtcNow < HwBrokenUntil) return "";
+                if ((DateTime.UtcNow - HwCheckedAt).TotalMinutes < 30) return HwCached;
+                HwCheckedAt = DateTime.UtcNow;
+                HwCached = "";
+                try
+                {
+                    var options = Reflect.Call(Reflect.Get(st.Source, "_config"), "GetConfiguration", "encoding");
+                    var enabled = !(Reflect.Get(options, "EnableHardwareEncoding") is bool e) || e;
+                    var mode = Reflect.Get(options, "HardwareAccelerationMode") is int m ? m : 1;
+                    if (!enabled || mode == 0) { Log(st.Source, "Puente: Emby tiene la aceleración por hardware desactivada; normalización por CPU"); return ""; }
+                    var candidates = new List<string>();
+                    if (mode == 2 && Reflect.Get(options, "CodecConfigurations") is Array configs)
+                    {
+                        var ordered = new List<object>();
+                        foreach (var c in configs) if (Reflect.Get(c, "IsEnabled") is bool on && on) ordered.Add(c);
+                        ordered.Sort((a, b) => ((Reflect.Get(a, "Priority") as int?) ?? 0).CompareTo((Reflect.Get(b, "Priority") as int?) ?? 0));
+                        foreach (var c in ordered)
+                        {
+                            var id = (Reflect.Get(c, "CodecId") as string ?? "").ToLowerInvariant();
+                            if (!id.Contains("264") && !id.Contains("avc")) continue;
+                            var kind = id.Contains("qsv") || id.Contains("quicksync") ? "qsv" : id.Contains("vaapi") ? "vaapi" : null;
+                            if (kind != null && !candidates.Contains(kind)) candidates.Add(kind);
+                        }
+                    }
+                    else { candidates.Add("qsv"); candidates.Add("vaapi"); }
+                    var device = RenderDevice();
+                    if (device == null) { Log(st.Source, "Puente: no hay /dev/dri/renderD*; normalización por CPU"); return ""; }
+                    foreach (var kind in candidates)
+                        if (TestHardware(kind, device)) { HwCached = kind; Log(st.Source, "Puente: normalización con la gráfica (" + kind + ", " + device + ")"); return kind; }
+                    Log(st.Source, "Puente: la gráfica no codifica H.264 (" + string.Join("/", candidates.ToArray()) + "); normalización por CPU");
+                }
+                catch (Exception ex) { Log(st.Source, "Puente: no se pudieron leer los ajustes de transcodificación de Emby (" + ex.Message + "); normalización por CPU"); }
+                return "";
+            }
+        }
+
+        static string RenderDevice()
+        {
+            try
+            {
+                var env = Environment.GetEnvironmentVariable("EMBY_LIVE_RENDER_DEVICE");
+                if (!string.IsNullOrEmpty(env) && File.Exists(env)) return env;
+                var devices = Directory.GetFiles("/dev/dri", "renderD*");
+                Array.Sort(devices, StringComparer.Ordinal);
+                return devices.Length > 0 ? devices[0] : null;
+            }
+            catch { return null; }
+        }
+
+        static bool TestHardware(string kind, string device)
+        {
+            try
+            {
+                var init = kind == "qsv" ? "-init_hw_device vaapi=va:" + device + " -init_hw_device qsv=qs@va -filter_hw_device qs"
+                                         : "-init_hw_device vaapi=va:" + device + " -filter_hw_device va";
+                var upload = kind == "qsv" ? "format=nv12,hwupload=extra_hw_frames=64" : "format=nv12,hwupload";
+                var info = new ProcessStartInfo(Tool("ffmpeg"), "-hide_banner -nostdin -loglevel error " + init
+                    + " -f lavfi -i color=c=black:s=1280x720:r=25 -frames:v 5 -vf " + upload + " -c:v h264_" + kind + " -f null -")
+                {
+                    UseShellExecute = false,
+                    RedirectStandardOutput = true,
+                    RedirectStandardError = true,
+                    CreateNoWindow = true,
+                    WorkingDirectory = AppDir(),
+                };
+                HardwareEnvironment(info);
+                using (var process = Process.Start(info))
+                {
+                    process.OutputDataReceived += (sender, e) => { };
+                    process.ErrorDataReceived += (sender, e) => { };
+                    process.BeginOutputReadLine();
+                    process.BeginErrorReadLine();
+                    if (!process.WaitForExit(8000)) { try { process.Kill(); } catch { } return false; }
+                    return process.ExitCode == 0;
+                }
+            }
+            catch { return false; }
+        }
+
+        /// Las variables que pone el lanzador de ffmpeg de Emby (bin/emby-ffmpeg) para los controladores de la gráfica
+        static void HardwareEnvironment(ProcessStartInfo info)
+        {
+            var app = AppDir();
+            var dri = Path.Combine(app, "lib", "dri");
+            if (Directory.Exists(dri)) SetEnv(info, "LIBVA_DRIVERS_PATH", dri);
+            var vendors = Path.Combine(app, "etc", "OpenCL", "vendors");
+            if (Directory.Exists(vendors)) SetEnv(info, "OCL_ICD_VENDORS", vendors);
+            SetEnv(info, "NEOReadDebugKeys", "1");
+            SetEnv(info, "OverrideGpuAddressSpace", "48");
+        }
+
+        static void SetEnv(ProcessStartInfo info, string name, string value)
+        {
+            if (Environment.GetEnvironmentVariable(name) == null) info.Environment[name] = value;
         }
 
         // ---------------------------------------------------------------------------------------------------------
@@ -485,7 +700,16 @@ namespace EmbyNoShare.Runtime
             // tras un fallo, antes de pedírselo a Emby (que registra cada error con su traza), ¿acepta conexiones?
             if (st.GenFailures > 0) Reachable(st.Remuxed ? st.RemuxUrl : st.OriginalUrl);
             object result;
-            if (!st.Detected) result = OpenFirst(st, gen.Cts.Token);
+            if (!st.Detected && st.Normalize && !IsHlsUrl(st.OriginalUrl))
+            {
+                // normalizado: ffmpeg abre el origen directamente (sin conexión previa, que en un origen lento costaría lo mismo dos veces)
+                st.Detected = true;
+                st.Remuxed = true;
+                st.RemuxUrl = st.OriginalUrl;
+                Log(st.Source, "Puente: el origen se normaliza a H.264 1080p" + FpsText(st.TargetFps) + " + AAC" + (st.Hw.Length > 0 ? " (" + st.Hw + ")" : " (CPU)"));
+                result = Remux(st, null, gen.Cts.Token);
+            }
+            else if (!st.Detected) result = OpenFirst(st, gen.Cts.Token);
             else
             {
                 var opening = (Task)Reflect.Call(st.Source, "OpenStream", null, st.MediaSource, st.Remuxed ? st.RemuxUrl : st.OriginalUrl,
@@ -569,7 +793,7 @@ namespace EmbyNoShare.Runtime
         /// H.264 1080p25 + AAC estéreo: formato de la intro mientras no se conoce el del origen
         static JsonElement[] DefaultFormat(State st)
         {
-            const string json = "[{\"codec_type\":\"video\",\"codec_name\":\"h264\",\"profile\":\"High\",\"level\":40,\"width\":1920,\"height\":1080,"
+            const string json = "[{\"codec_type\":\"video\",\"codec_name\":\"h264\",\"profile\":\"High\",\"level\":42,\"width\":1920,\"height\":1080,"
                 + "\"pix_fmt\":\"yuv420p\",\"r_frame_rate\":\"25/1\",\"avg_frame_rate\":\"25/1\",\"field_order\":\"progressive\",\"has_b_frames\":2,"
                 + "\"sample_aspect_ratio\":\"1:1\",\"id\":\"0x100\"},{\"codec_type\":\"audio\",\"codec_name\":\"aac\",\"sample_rate\":48000,\"channels\":2,\"id\":\"0x101\"}]";
             var list = new List<JsonElement>();
@@ -640,7 +864,7 @@ namespace EmbyNoShare.Runtime
         }
 
         static readonly object IntroLock = new object();
-        const string IntroCacheVersion = "3";   // súbelo si cambia cómo se prepara la intro guardada
+        const string IntroCacheVersion = "4";   // súbelo si cambia cómo se prepara la intro guardada
 
         /// Caudal de la intro (barras, negro) es mínimo y Emby decidiría con él (p. ej. copiar a un cliente limitado): se
         /// declara uno de canal HD normal hasta que llega el origen y Emby lo analiza
@@ -876,9 +1100,10 @@ namespace EmbyNoShare.Runtime
                 // por posición, no por PID: Emby elige las pistas por su orden
                 if (type == "video")
                 {
+                    // normalizado, la cadencia puede subir de 25 a 50 sin que nada tenga que decidir de nuevo
                     var field = Str(s, "field_order") ?? "progressive";
                     b.Append(string.Format(CultureInfo.InvariantCulture, "v:{0}:{1}x{2}:{3}:{4}:{5};", Str(s, "codec_name"), Int(s, "width"),
-                        Int(s, "height"), field == "progressive" ? "p" : "i", Rate(s), Str(s, "pix_fmt")));
+                        Int(s, "height"), field == "progressive" ? "p" : "i", st.Normalize ? "" : Rate(s), Str(s, "pix_fmt")));
                 }
                 else if (type == "audio")
                     b.Append(string.Format(CultureInfo.InvariantCulture, "a:{0}:{1};", Str(s, "codec_name"), Int(s, "channels")));
@@ -1164,6 +1389,7 @@ namespace EmbyNoShare.Runtime
                     var streams = FfprobeStreams(path);
                     if (streams != null)
                     {
+                        st.FrameDur = FrameDuration(streams);
                         var wasDefault = st.DefaultFormat;
                         var material = Material(st, streams);
                         var changed = material != st.Material;
@@ -1780,9 +2006,11 @@ namespace EmbyNoShare.Runtime
                     return null;
             }
 
-            // PID de la tabla de la intro: uno que el canal no use (se sustituye por la del canal)
+            // PID de la tabla de la intro: el del formato fijo si se normaliza; si no, uno que el canal no use (se sustituye
+            // por la del canal)
             st.IntroPmtPid = 0x1FF0;
-            while (st.MediaPids.Contains(st.IntroPmtPid) || st.IntroPmtPid == st.PmtPid || st.IntroPmtPid == st.PcrPid) st.IntroPmtPid--;
+            if (st.Normalize) st.IntroPmtPid = 0x1000;
+            else while (st.MediaPids.Contains(st.IntroPmtPid) || st.IntroPmtPid == st.PmtPid || st.IntroPmtPid == st.PcrPid) st.IntroPmtPid--;
 
             var image = intro == null || IsImage(intro);
             var introAudio = !image && HasAudio(intro);
