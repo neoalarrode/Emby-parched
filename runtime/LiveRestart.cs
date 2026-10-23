@@ -58,6 +58,7 @@ namespace EmbyNoShare.Runtime
                 var url = Reflect.Get(state, "RequestedUrl") as string ?? "";
                 if (url.IndexOf("live.m3u8", StringComparison.OrdinalIgnoreCase) < 0) return false;
                 var manager = Reflect.Get(service, "EncodingManager");
+                if (manager != null) Manager = manager;
                 var playSession = Reflect.Get(job, "PlaySessionId") as string;
                 // Emby quita la conversión de su lista antes de pararla a propósito: si sigue, ha muerto sola
                 if (manager == null || playSession == null || !ReferenceEquals(Reflect.Call(manager, "GetTranscodingJob", playSession), job)) return false;
@@ -105,7 +106,22 @@ namespace EmbyNoShare.Runtime
             try
             {
                 var path = (string)Reflect.Get(job, "Path");
-                var completed = (Array)Reflect.Call(job, "GetCompletedSegments");
+                // solo segmentos que existen de verdad: si ffmpeg se cerró antes de terminar el primero, Emby lo da por
+                // completo con duración 0 y la lista anunciaría un segmento inexistente
+                var all = (Array)Reflect.Call(job, "GetCompletedSegments");
+                var dir = Path.GetDirectoryName(path) ?? "";
+                var kept = new List<object>();
+                foreach (var item in all)
+                {
+                    var info = Reflect.Get(item, "Value");
+                    var name = Reflect.Get(item, "Key") as string;
+                    var duration = Reflect.Get(info, "Duration") as double? ?? 0;
+                    var media = Reflect.Get(info, "SegmentType")?.ToString() == "Media";
+                    if (media && (duration <= 0.01 || name == null || !File.Exists(Path.Combine(dir, name)))) continue;
+                    kept.Add(item);
+                }
+                var completed = Array.CreateInstance(all.GetType().GetElementType(), kept.Count);
+                for (var i = 0; i < kept.Count; i++) completed.SetValue(kept[i], i);
                 int next = 0;
                 double end = 0;
                 foreach (var item in completed)
@@ -136,6 +152,10 @@ namespace EmbyNoShare.Runtime
                     }
                 }
                 Reflect.Set(state, "Id", Guid.NewGuid());
+                // la conversión nueva se registra con la sesión de la petición: que no se pierda
+                var request = Reflect.Get(state, "BaseRequest");
+                if (string.IsNullOrEmpty(Reflect.Get(request, "PlaySessionId") as string) && Reflect.Get(job, "PlaySessionId") is string session && session.Length > 0)
+                    Reflect.Set(request, "PlaySessionId", session);
                 try { Reflect.Call(Reflect.Get(state, "TranscodeLog"), "Clear"); } catch { }
                 lock (Sync) Redecisions.Remove(state);
                 Redecide(service, job, state);
@@ -394,7 +414,23 @@ namespace EmbyNoShare.Runtime
 
         /// BaseHlsService.WaitForMinimumSegmentCount: los segmentos de la conversión vigente (si la que se esperaba se
         /// relanzó, la espera seguiría para siempre mirando la vieja)
-        public static object CompletedSegments(object job) => Reflect.Call(Latest(job), "GetCompletedSegments");
+        public static object CompletedSegments(object job)
+        {
+            var current = Latest(job);
+            try
+            {
+                // la esperada terminó sin sustituta conocida: la vigente de su sesión
+                if (Reflect.Get(current, "HasExited") is bool exited && exited && Manager != null && Reflect.Get(current, "PlaySessionId") is string session)
+                {
+                    var bySession = Reflect.Call(Manager, "GetTranscodingJob", session);
+                    if (bySession != null) current = Latest(bySession);
+                }
+            }
+            catch { }
+            return Reflect.Call(current, "GetCompletedSegments");
+        }
+
+        static object Manager;
 
         /// BaseHlsService.GetLivePlaylistText: la conversión vigente; si la petición llega sin ella (otra petición
         /// simultánea la arrancó, o se está relanzando), la de su sesión, esperando un poco a que aparezca
@@ -406,6 +442,7 @@ namespace EmbyNoShare.Runtime
                 if (job != null && !(Reflect.Get(job, "HasExited") is bool exited && exited)) return job;
                 var session = Reflect.Get(Reflect.Get(state, "BaseRequest"), "PlaySessionId") as string;
                 var manager = Reflect.Get(service, "EncodingManager");
+                if (manager != null) Manager = manager;
                 if (string.IsNullOrEmpty(session) || manager == null) return job;
                 for (var i = 0; i < 100; i++)
                 {
@@ -550,7 +587,7 @@ namespace EmbyNoShare.Runtime
                 return string.Format(CultureInfo.InvariantCulture, "vídeo {0} {1}x{2}{3} -> {4} (máx. {5}x{6}, {7} bps)",
                     v == null ? "-" : Reflect.Get(v, "Codec"), v == null ? 0 : Reflect.Get(v, "Width"), v == null ? 0 : Reflect.Get(v, "Height"),
                     v != null && Reflect.Get(v, "IsInterlaced") is bool i && i ? "i" : "p", Reflect.Get(state, "OutputVideoCodec"),
-                    Reflect.Get(request, "MaxWidth"), Reflect.Get(request, "MaxHeight"), Reflect.Get(state, "OutputVideoBitrate"));
+                    Reflect.Get(request, "MaxWidth") ?? "-", Reflect.Get(request, "MaxHeight") ?? "-", Reflect.Get(state, "OutputVideoBitrate") ?? "-");
             }
             catch { return "?"; }
         }

@@ -93,6 +93,8 @@ namespace EmbyNoShare.Runtime
             public readonly List<double> GapValues = new List<double>();
             public readonly List<DateTime> GapTimes = new List<DateTime>();
             public double BurstGap;
+            public long? GenFirstPts, GenLastPts;     // contenido del origen recibido en esta conexión (PTS de vídeo)
+            public DateTime GenFirstData;
             public readonly object GenLock = new object();
             public string ActivityKey;
 
@@ -471,6 +473,8 @@ namespace EmbyNoShare.Runtime
                 st.Done.Clear();
                 st.LastActivity = DateTime.UtcNow;
                 st.LastData = null;
+                st.GenFirstPts = null;
+                st.GenLastPts = null;
                 st.ActivityKey = null;
             }
             if (old != null) Task.Delay(15000).ContinueWith(_ => { try { Directory.Delete(old.Dir, true); } catch { } });
@@ -592,7 +596,7 @@ namespace EmbyNoShare.Runtime
             }
             // un trozo de más: el último que corta ffmpeg queda incompleto y no se usa
             var args = EncoderArguments(st, st.Format, st.Intro, seconds + IntroSegmentSeconds);
-            var key = args + "|" + (st.Intro == null ? "" : File.GetLastWriteTimeUtc(st.Intro).Ticks + "|" + new FileInfo(st.Intro).Length);
+            var key = IntroCacheVersion + "|" + args + "|" + (st.Intro == null ? "" : File.GetLastWriteTimeUtc(st.Intro).Ticks + "|" + new FileInfo(st.Intro).Length);
             string hash;
             using (var sha = System.Security.Cryptography.SHA1.Create())
                 hash = BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(key))).Replace("-", "").Substring(0, 16).ToLowerInvariant();
@@ -633,6 +637,7 @@ namespace EmbyNoShare.Runtime
         }
 
         static readonly object IntroLock = new object();
+        const string IntroCacheVersion = "3";   // súbelo si cambia cómo se prepara la intro guardada
 
         /// Caudal de la intro (barras, negro) es mínimo y Emby decidiría con él (p. ej. copiar a un cliente limitado): se
         /// declara uno de canal HD normal hasta que llega el origen y Emby lo analiza
@@ -1101,12 +1106,22 @@ namespace EmbyNoShare.Runtime
             return copy;
         }
 
+        /// Segundos de contenido que el origen lleva mandados por delante del tiempo real en esta conexión
+        static double Ahead(State st)
+        {
+            if (st.GenFirstPts == null || st.GenLastPts == null) return 0;
+            var content = Mod(st.GenLastPts.Value - st.GenFirstPts.Value) / (double)Clock;
+            if (content > 3600) return 0;
+            return Math.Max(0, content - (DateTime.UtcNow - st.GenFirstData).TotalSeconds);
+        }
+
         static void CheckStall(State st)
         {
             if (st.GenStarting || DateTime.UtcNow < st.NextGenRestart) return;
             var idle = (DateTime.UtcNow - st.LastActivity).TotalSeconds;
-            // tras un intento fallido, el siguiente a los 3 s
-            if (idle < (st.GenFailures > 0 ? 3 : Math.Max(Stall, 3 * st.BurstGap + 2))) return;
+            // tras un intento fallido, el siguiente a los 3 s; si no, el umbral cuenta también lo que el origen ha mandado por
+            // delante del tiempo real (una ráfaga de 12 s permite 12 s sin datos)
+            if (idle < (st.GenFailures > 0 ? 3 : Math.Max(Stall, 3 * st.BurstGap + 2) + Ahead(st))) return;
             Log(st.Source, "Puente: " + ((int)idle).ToString(CultureInfo.InvariantCulture) + " s sin datos del origen, se abre otra conexión");
             RestartGen(st, 0);
         }
@@ -1207,6 +1222,8 @@ namespace EmbyNoShare.Runtime
                 st.OutNextDts = Mod(lastOut + st.FrameDur);
                 st.RunRawNext = Mod(lastRaw + st.FrameDur);
                 st.RunKind = 2;
+                if (st.GenFirstPts == null) { st.GenFirstPts = firstDts.Value; st.GenFirstData = DateTime.UtcNow; }
+                st.GenLastPts = Mod(lastRaw + st.FrameDur);
             }
             finally
             {
