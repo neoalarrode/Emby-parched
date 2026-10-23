@@ -234,7 +234,9 @@ namespace EmbyNoShare.Runtime
                         if (!candidates.Contains(next)) candidates.Add(next);
                     }
                 double? dts = null;
-                var deadline = DateTime.UtcNow.AddSeconds(4);
+                // con el puente (LiveIntro) los trozos se publican completos: no hay uno a medio escribir que esperar
+                var bridged = AppDomain.CurrentDomain.GetData("EmbyNoShare.Bridge." + (Reflect.Get(liveStream, "UniqueId") as string)) is bool b && b;
+                var deadline = DateTime.UtcNow.AddSeconds(bridged ? 0.3 : 4);
                 while (dts == null)
                 {
                     foreach (var file in candidates) { dts = KeyframeDts(file, target); if (dts != null) break; }

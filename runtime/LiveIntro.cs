@@ -1405,6 +1405,8 @@ namespace EmbyNoShare.Runtime
             try
             {
                 if (raw.Length < 188 * 4) return;
+                // la intro que seguiría (para rellenar audio al pasar de ella al origen), antes de que un cambio de formato la cambie
+                var introNext = st.RunKind == 1 ? PeekIntro(st) : null;
                 var tables = ParseTables(raw);
                 var signature = tables == null ? st.Signature : Signature(raw, tables);
                 var formatChanged = false;
@@ -1465,8 +1467,20 @@ namespace EmbyNoShare.Runtime
                 var discontinuous = Reflect.Get(file, "IsDiscontinuity") is bool d && d;
                 var newRun = st.RunKind != 2 || st.RunRawNext == null || discontinuous
                              || Math.Abs(Signed(firstDts.Value - st.RunRawNext.Value)) > Clock;
+                var introOffset = st.RunKind == 1 ? st.RunOffset : (long?)null;
                 if (newRun) st.RunOffset = Mod(st.OutNextDts - firstDts.Value);
+                // de la intro al origen: el audio del origen suele empezar algo después de su primer fotograma; el hueco se
+                // rellena con audio de la intro (mismo formato) hasta donde empieza el del origen
+                var fill = newRun && introOffset != null && introNext != null && (st.Normalize || !formatChanged)
+                    ? IntroAudioFill(st, introOffset.Value, introNext, raw, st.RunOffset) : null;
                 var output = Rewrite(st, raw, st.RunOffset, newRun, false, out var lastRaw, out var lastOut);
+                if (fill != null && fill.Length > 0)
+                {
+                    var joined = new byte[fill.Length + output.Length];
+                    Buffer.BlockCopy(fill, 0, joined, 0, fill.Length);
+                    Buffer.BlockCopy(output, 0, joined, fill.Length, output.Length);
+                    output = joined;
+                }
                 if (lastOut < 0) return;
                 long duration = 0;
                 if (Reflect.Get(file, "Duration") is TimeSpan span && span > TimeSpan.Zero) duration = (long)(span.TotalSeconds * Clock);
@@ -1618,6 +1632,58 @@ namespace EmbyNoShare.Runtime
                 }
             }
             return output.ToArray();
+        }
+
+        /// Audio de la intro (siguiente trozo, en su línea de tiempo) entre el final del ya publicado y el comienzo del audio
+        /// del origen en cada pista, listo para ir delante del trozo del origen
+        static byte[] IntroAudioFill(State st, long introOffset, byte[] intro, byte[] raw, long sourceOffset)
+        {
+            try
+            {
+                // dónde empieza el audio del origen que se queda en cada pista (ya en la línea publicada): los PES que empiezan
+                // antes del final del audio publicado se descartan enteros al reescribir (y llevan varias tramas)
+                var starts = new Dictionary<int, long>();
+                for (var p = 0; p + 188 <= raw.Length; p += 188)
+                {
+                    var pid = PidOf(raw, p);
+                    if (raw[p] != 0x47 || pid == st.VideoPid || !st.MediaPids.Contains(pid) || (raw[p + 1] & 0x40) == 0 || starts.ContainsKey(pid)) continue;
+                    if (!(PesPts(raw, p, false) is long pts)) continue;
+                    var at = Mod(pts + sourceOffset);
+                    if (st.AudioNext.TryGetValue(pid, out var next) && Signed(at - next) < -Clock / 100) continue;
+                    starts[pid] = at;
+                }
+                var output = new MemoryStream();
+                var taking = new Dictionary<int, bool>();
+                var packet = new byte[188];
+                for (var p = 0; p + 188 <= intro.Length; p += 188)
+                {
+                    if (intro[p] != 0x47) continue;
+                    var pid = PidOf(intro, p);
+                    if (pid == st.VideoPid || !starts.ContainsKey(pid)) continue;
+                    if ((intro[p + 1] & 0x40) != 0)
+                    {
+                        var take = false;
+                        if (PesPts(intro, p, false) is long pts)
+                        {
+                            var at = Mod(pts + introOffset);
+                            var from = st.AudioNext.TryGetValue(pid, out var next) ? next : at;
+                            take = Signed(at - from) >= -Clock / 100 && Signed(at - starts[pid]) < 0;
+                        }
+                        taking[pid] = take;
+                    }
+                    if (!taking.TryGetValue(pid, out var keep) || !keep) continue;
+                    Buffer.BlockCopy(intro, p, packet, 0, 188);
+                    if ((packet[1] & 0x40) != 0)
+                    {
+                        ShiftPes(packet, introOffset);
+                        if (PesPts(packet, 0, false) is long outPts) st.AudioLast[pid] = outPts;
+                    }
+                    ShiftPcr(packet, introOffset);
+                    WritePacket(st, output, packet);
+                }
+                return output.ToArray();
+            }
+            catch { return null; }
         }
 
         /// El siguiente trozo de intro que se publicaría (sin sacarlo)
