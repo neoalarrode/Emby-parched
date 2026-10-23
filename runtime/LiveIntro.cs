@@ -16,8 +16,9 @@
 //   - Cambio de formato a mitad de directo (resolución, entrelazado, códec, pistas): se detecta en cada trozo, Emby
 //     vuelve a analizar el canal, la intro se regenera en el formato nuevo, el trozo va con discontinuidad (HLS directo)
 //     y PMT con versión nueva (MPEG-TS), y las conversiones de Emby se relanzan con una decisión nueva (LiveRestart).
-//   - Si al abrir el origen no da nada en 8 s, el canal arranca con la intro en un formato estándar y se adapta al real
-//     cuando llegue.
+//   - Apertura al momento: Emby responde ya con la intro en formato estándar (H.264 1080p25 + AAC), codificada una
+//     vez y guardada en su caché; el origen se conecta aparte y, cuando llega, su formato entra como un cambio de
+//     formato más (si es distinto del de la intro).
 // EMBY_LIVE_BRIDGE=0 lo desactiva. EMBY_LIVE_INTRO: vídeo o imagen de la intro (si no, negro con silencio).
 using System;
 using System.Collections.Generic;
@@ -38,7 +39,6 @@ namespace EmbyNoShare.Runtime
         const long Wrap = 1L << 33;
         const int SegmentSeconds = 3;
         const int EncodedAhead = 3;             // trozos de intro codificados por delante como máximo
-        const double FormatWait = 8;            // s esperando el formato del origen al abrir
         const double LowLead = 1.0;             // s de margen publicado por debajo de los cuales entra la intro
         const double MaxLead = 25;              // s de margen por encima de los cuales se descartan trozos (volver al directo)
         const double Stall = 10;                // s sin datos del origen para abrir otra conexión
@@ -67,7 +67,9 @@ namespace EmbyNoShare.Runtime
         sealed class State
         {
             public object Source, MediaSource;
-            public string Uid, BaseDir, BasePattern, Intro;
+            public string Uid, BaseDir, BasePattern, CacheDir, Intro;
+            public object[] Cached;              // intro en formato estándar, guardada
+            public int CachedNext;
             public Type InfoType;
             public CancellationTokenSource Main;
             public CancellationToken Token;
@@ -76,11 +78,11 @@ namespace EmbyNoShare.Runtime
             public string OriginalUrl, RemuxUrl, RemuxMap;
             public object OriginalProtocol;
             public bool Remuxed;                 // entra por el ffmpeg de Emby (HLS u otro contenedor)
+            public bool Detected;                // ya se sabe si entra directo o por ffmpeg
             public Gen Gen;
             public int GenCount, GenFailures;
             public bool GenStarting;
             public DateTime NextGenRestart, LastActivity, GenStartedAt;
-            public Process FirstRemux;
             public readonly object GenLock = new object();
             public string ActivityKey;
 
@@ -225,49 +227,21 @@ namespace EmbyNoShare.Runtime
             try
             {
                 Prepare(st);
-                var first = OpenFirst(st, ct);
+                // al momento: la intro en formato estándar (preparada una vez y guardada); el origen se conecta aparte
+                st.Format = DefaultFormat(st);
+                st.DefaultFormat = true;
+                st.Material = Material(st, st.Format);
+                st.FrameDur = FrameDuration(st.Format);
+                st.Cached = IntroCache(st);
+                ApplyTables(st, ParseTables((byte[])((object[])st.Cached[0])[0]));
                 lock (Sync) States[source] = st;
                 st.Token.Register(() => Cleanup(st));
-                StartGen(st, first);
+                RestartGen(st, 0);
 
-                var format = WaitFormat(st, ct);
-                if (format == null)
-                {
-                    Log(source, "Puente: el origen no da formato en " + FormatWait + " s; se arranca con la intro en formato estándar");
-                    format = DefaultFormat(st);
-                    st.DefaultFormat = true;
-                }
-                else Log(source, "Puente: formato del origen en " + Ms(started) + " ms: " + Describe(format) + (st.Remuxed ? " (entra por ffmpeg)" : ""));
-                st.Format = format;
-                st.Material = Material(st, format);
-                st.FrameDur = FrameDuration(format);
-
-                if (st.PassThrough)
-                {
-                    // sin vídeo (radio): se publica tal cual
-                    Probe(st, Path.Combine(st.BaseDir, "probe.ts"), ct);
-                    StartPublisher(st);
-                    return;
-                }
-
-                StartEncoder(st);
-                var a = st.Enc == null ? null : TakeEncoded(st.Enc, 15000);
-                var b = a == null ? null : TakeEncoded(st.Enc, 15000);
-                if (b == null)
-                {
-                    var error = st.Enc?.Error.Trim() ?? "";
-                    StopEncoder(st);
-                    if (st.DefaultFormat) throw new Exception("Puente: ni el origen ni la intro responden: " + error);
-                    Log(source, "Puente: la intro no arranca, se sigue sin ella: " + error);
-                }
-                else
-                {
-                    if (st.DefaultFormat) ApplyTables(st, ParseTables((byte[])((object[])a)[0]));
-                    PublishIntro(st, (object[])a);
-                    PublishIntro(st, (object[])b);
-                }
-                Probe(st, st.DefaultFormat ? LastPublishedPath(st) : Path.Combine(st.BaseDir, "probe.ts"), ct);
-                Log(source, "Puente: canal listo en " + Ms(started) + " ms");
+                PublishIntro(st, NextCached(st));
+                PublishIntro(st, NextCached(st));
+                Probe(st, LastPublishedPath(st), ct);
+                Log(source, "Puente: canal listo con la intro en " + Ms(started) + " ms; el origen se conecta aparte");
                 StartPublisher(st);
             }
             catch
@@ -304,9 +278,12 @@ namespace EmbyNoShare.Runtime
             if (limit > TimeSpan.Zero && limit < TimeSpan.FromMinutes(10)) limit = TimeSpan.FromMinutes(10);
             Reflect.Set(source, "BufferLimit", limit);
             st.Uid = (string)Reflect.Get(source, "UniqueId");
-            var temp = (string)Reflect.Call(Reflect.Get(source, "AppPaths"), "GetTranscodingTempPath");
+            var paths = Reflect.Get(source, "AppPaths");
+            var temp = (string)Reflect.Call(paths, "GetTranscodingTempPath");
             st.BaseDir = Path.Combine(temp, st.Uid);
             st.BasePattern = Path.Combine(st.BaseDir, "{0:0000000}.ts");
+            try { st.CacheDir = Path.Combine((string)Reflect.Get(paths, "CachePath"), "emby-noshare-intro"); }
+            catch { st.CacheDir = Path.Combine(temp, "emby-noshare-intro"); }
             Reflect.Set(source, "TempFilePath", st.BasePattern);
             Directory.CreateDirectory(st.BaseDir);
             st.InfoType = Reflect.Get(source, "CompletedSegmentFiles").GetType().GetGenericArguments()[0];
@@ -322,6 +299,7 @@ namespace EmbyNoShare.Runtime
             var contentType = Reflect.Get(result, "ContentType") as string ?? "";
             var responseUrl = Reflect.Get(result, "ResponseUrl") as string ?? st.OriginalUrl;
             var hls = IsHlsUrl(st.OriginalUrl) || IsHlsUrl(responseUrl) || contentType.IndexOf("mpegurl", StringComparison.OrdinalIgnoreCase) >= 0;
+            st.Detected = true;
             if (!hls && !IsOtherContainer(contentType)) return result;
 
             st.Remuxed = true;
@@ -434,11 +412,8 @@ namespace EmbyNoShare.Runtime
             var process = Process.Start(info);
             process.ErrorDataReceived += (sender, e) => { if (!string.IsNullOrEmpty(e.Data)) Log(st.Source, "Puente: ffmpeg del origen: " + e.Data); };
             process.BeginErrorReadLine();
-            lock (st)
-            {
-                if (st.Gen != null) lock (st.Gen.Remux) st.Gen.Remux.Add(process);
-                else st.FirstRemux = process;
-            }
+            var gen = st.Gen;
+            if (gen != null) lock (gen.Remux) gen.Remux.Add(process);
 
             var resultType = OpenStreamResultType(st.Source);
             var ctor = resultType.GetConstructors()[0];
@@ -463,9 +438,11 @@ namespace EmbyNoShare.Runtime
         // ---------------------------------------------------------------------------------------------------------
         // Generaciones de la ingesta
 
-        /// Empieza a escribir el buffer desde una respuesta del origen, en la carpeta de una generación nueva
-        static void StartGen(State st, object result)
+        /// Conexión nueva con el origen en una generación nueva (carpeta y retención propias); la anterior se para
+        static void Connect(State st)
         {
+            var old = st.Gen;
+            if (old != null) StopGen(old);
             var gen = new Gen { Cts = CancellationTokenSource.CreateLinkedTokenSource(st.Token) };
             lock (st)
             {
@@ -474,13 +451,22 @@ namespace EmbyNoShare.Runtime
                 Directory.CreateDirectory(gen.Dir);
                 st.Gen = gen;
                 st.GenStartedAt = DateTime.UtcNow;
-                if (st.FirstRemux != null) { gen.Remux.Add(st.FirstRemux); st.FirstRemux = null; }
                 st.Held.Clear();
                 st.Done.Clear();
                 st.LastActivity = DateTime.UtcNow;
                 st.ActivityKey = null;
             }
-            if (result == null) return;
+            if (old != null) Task.Delay(15000).ContinueWith(_ => { try { Directory.Delete(old.Dir, true); } catch { } });
+
+            object result;
+            if (!st.Detected) result = OpenFirst(st, gen.Cts.Token);
+            else
+            {
+                var opening = (Task)Reflect.Call(st.Source, "OpenStream", null, st.MediaSource, st.Remuxed ? st.RemuxUrl : st.OriginalUrl,
+                    st.OriginalProtocol, gen.Cts.Token, 0);
+                opening.GetAwaiter().GetResult();
+                result = Reflect.Get(opening, "Result");
+            }
             // StartStreaming lee TempFilePath al arrancar su tarea (antes de completar tcs)
             lock (st.GenLock)
             {
@@ -512,43 +498,25 @@ namespace EmbyNoShare.Runtime
                 if (st.GenStarting || st.Token.IsCancellationRequested) return;
                 st.GenStarting = true;
             }
-            var old = st.Gen;
             Task.Run(() =>
             {
                 try
                 {
                     if (delaySeconds > 0) Thread.Sleep(TimeSpan.FromSeconds(delaySeconds));
-                    if (old != null) StopGen(old);
-                    StartGen(st, null);       // carpeta y retención nuevas antes de conectar
-                    var opening = (Task)Reflect.Call(st.Source, "OpenStream", null, st.MediaSource, st.Remuxed ? st.RemuxUrl : st.OriginalUrl, st.OriginalProtocol, st.Gen.Cts.Token, 0);
-                    opening.GetAwaiter().GetResult();
-                    var result = Reflect.Get(opening, "Result");
-                    lock (st.GenLock)
-                    {
-                        var gen = st.Gen;
-                        Reflect.Set(st.Source, "TempFilePath", Path.Combine(gen.Dir, "{0:0000000}.ts"));
-                        try
-                        {
-                            var tcs = new TaskCompletionSource<bool>();
-                            Reflect.Call(st.Source, "StartStreaming", st.MediaSource, Reflect.Get(result, "ResponseInfo"), Reflect.Get(result, "ConectionContext"),
-                                Reflect.Get(result, "ResponseUrl"), Reflect.Get(result, "MediaProtocol"), tcs, gen.Cts.Token);
-                            tcs.Task.Wait(15000);
-                        }
-                        finally { Reflect.Set(st.Source, "TempFilePath", st.BasePattern); }
-                    }
-                    Log(st.Source, "Puente: conexión " + st.Gen.Id.ToString(CultureInfo.InvariantCulture) + " con el origen abierta");
+                    var start = DateTime.UtcNow;
+                    Connect(st);
+                    Log(st.Source, "Puente: conexión " + st.Gen.Id.ToString(CultureInfo.InvariantCulture) + " con el origen abierta en " + Ms(start) + " ms");
                 }
                 catch (Exception e)
                 {
                     st.GenFailures++;
-                    Log(st.Source, "Puente: no se pudo reconectar con el origen (" + st.GenFailures.ToString(CultureInfo.InvariantCulture) + "): " + Inner(e).Message);
+                    if (!st.Token.IsCancellationRequested)
+                        Log(st.Source, "Puente: no se pudo conectar con el origen (" + st.GenFailures.ToString(CultureInfo.InvariantCulture) + "): " + Inner(e).Message);
                 }
                 finally
                 {
                     st.NextGenRestart = DateTime.UtcNow.AddSeconds(Math.Min(30, 5 * Math.Max(1, st.GenFailures)));
                     lock (st) { st.GenStarting = false; st.LastActivity = DateTime.UtcNow; }
-                    if (old != null)
-                        Task.Delay(15000).ContinueWith(_ => { try { Directory.Delete(old.Dir, true); } catch { } });
                 }
             });
         }
@@ -560,53 +528,9 @@ namespace EmbyNoShare.Runtime
         }
 
         // ---------------------------------------------------------------------------------------------------------
-        // Formato del origen
+        // Formato
 
-        /// Espera a que lo retenido del origen tenga la tabla de pistas y el formato de todas ellas (ffprobe)
-        static JsonElement[] WaitFormat(State st, CancellationToken ct)
-        {
-            var start = DateTime.UtcNow;
-            DateTime? ready = null;
-            var probePath = Path.Combine(st.BaseDir, "probe.ts");
-            while ((DateTime.UtcNow - start).TotalSeconds < FormatWait)
-            {
-                ct.ThrowIfCancellationRequested();
-                Thread.Sleep(ready == null ? 150 : 250);
-                var data = Snapshot(st, 12 * 1024 * 1024);
-                if (data.Length < 188 * 20) continue;
-                var tables = ParseTables(data);
-                if (tables == null) continue;
-                File.WriteAllBytes(probePath, data);
-                var streams = FfprobeStreams(probePath);
-                if (streams == null) continue;
-                var videoPid = (int)tables[4];
-                JsonElement? video = null;
-                var audioMissing = false;
-                var audioCount = 0;
-                foreach (var s in streams)
-                {
-                    var type = Str(s, "codec_type");
-                    if (type == "video" && video == null && Pid(s) == videoPid && Int(s, "width") > 0 && Int(s, "height") > 0
-                        && Str(s, "pix_fmt") != null && Rate(s) != null)
-                        video = s;
-                    if (type == "audio") { audioCount++; if (Int(s, "sample_rate") <= 0 || Int(s, "channels") <= 0) audioMissing = true; }
-                }
-                if (videoPid >= 0 && video == null) continue;
-                if (videoPid < 0 && audioCount == 0) continue;
-                if (ready == null) ready = DateTime.UtcNow;
-                var waited = (DateTime.UtcNow - ready.Value).TotalSeconds;
-                // el orden de campos sale al decodificar algún fotograma; el audio inactivo puede no llegar nunca
-                if (video != null && Str(video.Value, "field_order") == null && waited < 1.5) continue;
-                if (audioMissing && waited < 2) continue;
-                ApplyTables(st, tables);
-                st.Signature = Signature(data, tables);
-                st.PassThrough = videoPid < 0;
-                return streams;
-            }
-            return null;
-        }
-
-        /// H.264 1080p25 + AAC estéreo, para arrancar si el origen no da nada a tiempo
+        /// H.264 1080p25 + AAC estéreo: formato de la intro mientras no se conoce el del origen
         static JsonElement[] DefaultFormat(State st)
         {
             const string json = "[{\"codec_type\":\"video\",\"codec_name\":\"h264\",\"profile\":\"High\",\"level\":40,\"width\":1920,\"height\":1080,"
@@ -623,19 +547,83 @@ namespace EmbyNoShare.Runtime
             return list.ToArray();
         }
 
-        /// Lo retenido del origen hasta ahora, seguido
-        static byte[] Snapshot(State st, int max)
+        /// La intro en formato estándar, codificada una vez y guardada en la caché de Emby (se rehace si cambia el
+        /// fichero de la intro): trozos {byte[] datos, long PTS inicial, long duración}
+        static object[] IntroCache(State st)
         {
-            var files = new List<string>();
-            lock (st) foreach (var f in st.Held) files.Add(Reflect.Get(f, "Path") as string);
-            var output = new MemoryStream();
-            foreach (var file in files)
+            var seconds = 6;
+            if (st.Intro != null && !IsImage(st.Intro))
             {
-                if (output.Length >= max) break;
-                var bytes = ReadShared(file, 0, max - (int)output.Length);
-                output.Write(bytes, 0, bytes.Length - bytes.Length % 188);
+                var streams = FfprobeStreams(st.Intro);
+                var duration = 0.0;
+                if (streams != null)
+                    foreach (var s in streams)
+                        if (Str(s, "codec_type") == "video" && double.TryParse(Str(s, "duration"), NumberStyles.Float, CultureInfo.InvariantCulture, out var d)) duration = d;
+                seconds = (int)Math.Max(6, Math.Min(30, Math.Round(duration / SegmentSeconds) * SegmentSeconds));
             }
-            return output.ToArray();
+            // un trozo de más: el último que corta ffmpeg queda incompleto y no se usa
+            var args = EncoderArguments(st, st.Format, st.Intro, seconds + SegmentSeconds);
+            var key = args + "|" + (st.Intro == null ? "" : File.GetLastWriteTimeUtc(st.Intro).Ticks + "|" + new FileInfo(st.Intro).Length);
+            string hash;
+            using (var sha = System.Security.Cryptography.SHA1.Create())
+                hash = BitConverter.ToString(sha.ComputeHash(Encoding.UTF8.GetBytes(key))).Replace("-", "").Substring(0, 16).ToLowerInvariant();
+            var dir = Path.Combine(st.CacheDir, hash);
+            lock (IntroLock)
+            {
+                var cached = ReadIntroCache(dir);
+                if (cached != null) return cached;
+                Log(st.Source, "Puente: preparando la intro (solo la primera vez): ffmpeg " + args);
+                var enc = new Encoder();
+                StartProcess(st, enc, args, st.VideoPid, CancellationToken.None);
+                var segments = new List<object>();
+                object segment;
+                while ((segment = TakeEncoded(enc, 60000)) != null) segments.Add(segment);
+                if (segments.Count == 0) throw new Exception("Puente: no se pudo preparar la intro: " + enc.Error.Trim());
+                var tmp = dir + ".tmp";
+                try { if (Directory.Exists(tmp)) Directory.Delete(tmp, true); } catch { }
+                Directory.CreateDirectory(tmp);
+                var index = new StringBuilder();
+                for (var i = 0; i < segments.Count; i++)
+                {
+                    var s = (object[])segments[i];
+                    File.WriteAllBytes(Path.Combine(tmp, i.ToString("000", CultureInfo.InvariantCulture) + ".ts"), (byte[])s[0]);
+                    index.Append(((long)s[1]).ToString(CultureInfo.InvariantCulture)).Append(' ').Append(((long)s[2]).ToString(CultureInfo.InvariantCulture)).Append('\n');
+                }
+                File.WriteAllText(Path.Combine(tmp, "index.txt"), index.ToString());
+                try { if (Directory.Exists(dir)) Directory.Delete(dir, true); } catch { }
+                Directory.Move(tmp, dir);
+                return segments.ToArray();
+            }
+        }
+
+        static readonly object IntroLock = new object();
+
+        static object[] ReadIntroCache(string dir)
+        {
+            try
+            {
+                var indexPath = Path.Combine(dir, "index.txt");
+                if (!File.Exists(indexPath)) return null;
+                var lines = File.ReadAllLines(indexPath);
+                var segments = new List<object>();
+                for (var i = 0; i < lines.Length; i++)
+                {
+                    var parts = lines[i].Split(' ');
+                    if (parts.Length != 2) continue;
+                    var data = File.ReadAllBytes(Path.Combine(dir, i.ToString("000", CultureInfo.InvariantCulture) + ".ts"));
+                    segments.Add(new object[] { data, long.Parse(parts[0], CultureInfo.InvariantCulture), long.Parse(parts[1], CultureInfo.InvariantCulture) });
+                }
+                return segments.Count > 0 ? segments.ToArray() : null;
+            }
+            catch { return null; }
+        }
+
+        /// Siguiente trozo de la intro guardada, en bucle
+        static object[] NextCached(State st)
+        {
+            var segment = (object[])st.Cached[st.CachedNext % st.Cached.Length];
+            st.CachedNext++;
+            return segment;
         }
 
         static byte[] ReadShared(string file, long offset, int max)
@@ -822,15 +810,16 @@ namespace EmbyNoShare.Runtime
                 var pid = Pid(s);
                 if (st.MediaPids.Count > 0 && !st.MediaPids.Contains(pid)) continue;
                 var type = Str(s, "codec_type");
+                // por posición, no por PID: Emby elige las pistas por su orden
                 if (type == "video")
                 {
                     var field = Str(s, "field_order") ?? "progressive";
-                    b.Append(string.Format(CultureInfo.InvariantCulture, "v{0}:{1}:{2}x{3}:{4}:{5}:{6};", pid, Str(s, "codec_name"), Int(s, "width"),
+                    b.Append(string.Format(CultureInfo.InvariantCulture, "v:{0}:{1}x{2}:{3}:{4}:{5};", Str(s, "codec_name"), Int(s, "width"),
                         Int(s, "height"), field == "progressive" ? "p" : "i", Rate(s), Str(s, "pix_fmt")));
                 }
                 else if (type == "audio")
-                    b.Append(string.Format(CultureInfo.InvariantCulture, "a{0}:{1}:{2};", pid, Str(s, "codec_name"), Int(s, "channels")));
-                else b.Append(string.Format(CultureInfo.InvariantCulture, "o{0}:{1};", pid, Str(s, "codec_name") ?? type));
+                    b.Append(string.Format(CultureInfo.InvariantCulture, "a:{0}:{1};", Str(s, "codec_name"), Int(s, "channels")));
+                else b.Append(string.Format(CultureInfo.InvariantCulture, "o:{0};", Str(s, "codec_name") ?? type));
             }
             return b.ToString();
         }
@@ -953,7 +942,9 @@ namespace EmbyNoShare.Runtime
             {
                 if (!st.Bridging) Log(st.Source, "Puente: el origen no llega a tiempo (margen " + lead.ToString("0.0", CultureInfo.InvariantCulture) + " s), entra la intro");
                 st.Bridging = true;
-                if (st.Enc != null)
+                // mientras no se conoce el formato del origen, la intro guardada; después, la del formato actual
+                if (st.DefaultFormat) PublishIntro(st, NextCached(st));
+                else if (st.Enc != null)
                 {
                     var segment = TakeEncoded(st.Enc, 0) as object[];
                     if (segment != null) PublishIntro(st, segment);
@@ -962,7 +953,7 @@ namespace EmbyNoShare.Runtime
             CheckStall(st);
 
             // intro lista para cuando haga falta
-            if ((st.Enc == null || st.Enc.Done) && DateTime.UtcNow >= st.NextEncoderStart && st.Format != null)
+            if (!st.DefaultFormat && (st.Enc == null || st.Enc.Done) && DateTime.UtcNow >= st.NextEncoderStart && st.Format != null)
             {
                 if (st.Enc != null) Log(st.Source, "Puente: el ffmpeg de la intro terminó (" + st.Enc.Error.Trim() + "), se relanza");
                 st.NextEncoderStart = DateTime.UtcNow.AddSeconds(10);
@@ -1009,15 +1000,17 @@ namespace EmbyNoShare.Runtime
                 var formatChanged = false;
                 if (tables != null && (signature != st.Signature || st.DefaultFormat))
                 {
+                    ApplyTables(st, tables);
                     var streams = FfprobeStreams(path);
                     if (streams != null)
                     {
-                        ApplyTables(st, tables);
+                        var wasDefault = st.DefaultFormat;
                         var material = Material(st, streams);
-                        if (material != st.Material || st.DefaultFormat)
+                        var changed = material != st.Material;
+                        if (changed || wasDefault)
                         {
-                            formatChanged = true;
-                            Log(st.Source, "Puente: el formato del origen cambia: " + Describe(streams));
+                            Log(st.Source, (wasDefault ? "Puente: formato del origen: " : "Puente: el formato del origen cambia: ") + Describe(streams)
+                                           + (st.Remuxed ? " (entra por ffmpeg)" : "") + (changed ? "" : " (igual que la intro)"));
                             st.Format = streams;
                             st.Material = material;
                             st.DefaultFormat = false;
@@ -1026,13 +1019,18 @@ namespace EmbyNoShare.Runtime
                             File.WriteAllBytes(probe, raw);
                             Probe(st, probe, st.Token);
                             StopEncoder(st);
-                            StartEncoder(st);
-                            // conversiones de Emby (Emby.Server.MediaEncoding): relanzar con una decisión nueva
-                            try { (AppDomain.CurrentDomain.GetData("EmbyNoShare.LiveFormatChanged") as Action<string>)?.Invoke(st.Uid); }
-                            catch (Exception e) { Log(st.Source, "Puente: aviso a las conversiones fallido: " + e.Message); }
+                            if (st.VideoPid < 0) st.PassThrough = true;     // sin vídeo (radio): tal cual desde ahora
+                            else StartEncoder(st);
+                            if (changed)
+                            {
+                                formatChanged = true;
+                                // conversiones de Emby (Emby.Server.MediaEncoding): relanzar con una decisión nueva
+                                try { (AppDomain.CurrentDomain.GetData("EmbyNoShare.LiveFormatChanged") as Action<string>)?.Invoke(st.Uid); }
+                                catch (Exception e) { Log(st.Source, "Puente: aviso a las conversiones fallido: " + e.Message); }
+                            }
                         }
-                        st.Signature = signature;
                     }
+                    st.Signature = signature;
                 }
                 if (st.VideoPid < 0) return;
                 var firstDts = FirstVideoDts(raw, st.VideoPid);
@@ -1078,12 +1076,13 @@ namespace EmbyNoShare.Runtime
             var firstDts = FirstVideoDts(data, st.VideoPid);
             if (firstDts == null) return;
             StartOut(st);
-            var newRun = st.RunKind != 1;
+            var newRun = st.RunKind != 1 || st.RunRawNext == null || Math.Abs(Signed(firstDts.Value - st.RunRawNext.Value)) > Clock;
             if (newRun) st.RunOffset = Mod(st.OutNextDts - firstDts.Value);
-            var output = Rewrite(st, data, st.RunOffset, newRun, true, out _, out var lastOut);
+            var output = Rewrite(st, data, st.RunOffset, newRun, true, out var lastRaw, out var lastOut);
             if (lastOut < 0) return;
             Publish(st, output, (long)segment[2], Mod(firstDts.Value + st.RunOffset), false);
             st.OutNextDts = Mod(lastOut + st.FrameDur);
+            st.RunRawNext = Mod(lastRaw + st.FrameDur);
             st.RunKind = 1;
         }
 
@@ -1313,10 +1312,11 @@ namespace EmbyNoShare.Runtime
         // ---------------------------------------------------------------------------------------------------------
         // Intro
 
+        /// Intro en directo (bucle) en el formato actual del origen, para los cortes
         static void StartEncoder(State st)
         {
-            if (st.Format == null || st.VideoPid < 0) return;
-            var args = EncoderArguments(st, st.Format, st.Intro);
+            if (st.Format == null || st.VideoPid < 0 || st.DefaultFormat) return;
+            var args = EncoderArguments(st, st.Format, st.Intro, null);
             if (args == null)
             {
                 Log(st.Source, "Puente: no hay codificador para la intro en este formato; sin intro hasta que cambie");
@@ -1324,7 +1324,15 @@ namespace EmbyNoShare.Runtime
                 st.NextEncoderStart = DateTime.MaxValue;
                 return;
             }
+            Log(st.Source, "Puente: intro con ffmpeg " + args);
             var enc = new Encoder();
+            StartProcess(st, enc, args, st.VideoPid, st.Token);
+            st.Enc = enc;
+            st.NextEncoderStart = DateTime.UtcNow.AddSeconds(5);
+        }
+
+        static void StartProcess(State st, Encoder enc, string args, int videoPid, CancellationToken token)
+        {
             try
             {
                 var info = new ProcessStartInfo(Tool("ffmpeg"), args)
@@ -1335,7 +1343,6 @@ namespace EmbyNoShare.Runtime
                     CreateNoWindow = true,
                     WorkingDirectory = AppDir(),
                 };
-                Log(st.Source, "Puente: intro con ffmpeg " + args);
                 enc.Process = Process.Start(info);
                 enc.Process.ErrorDataReceived += (sender, e) =>
                 {
@@ -1343,18 +1350,16 @@ namespace EmbyNoShare.Runtime
                     lock (enc.Queue) enc.Error = (enc.Error + " " + e.Data).Length > 2000 ? e.Data : enc.Error + " " + e.Data;
                 };
                 enc.Process.BeginErrorReadLine();
-                var videoPid = st.VideoPid;
-                var token = st.Token;
                 var reader = new Thread(() => ReadEncoder(enc, videoPid, token)) { IsBackground = true, Name = "EmbyNoShare intro ffmpeg" };
                 reader.Start();
-                st.Enc = enc;
-                st.NextEncoderStart = DateTime.UtcNow.AddSeconds(5);
             }
             catch (Exception e)
             {
-                enc.Error = e.Message;
-                enc.Done = true;
-                st.Enc = enc;
+                lock (enc.Queue)
+                {
+                    enc.Error = e.Message;
+                    enc.Done = true;
+                }
             }
         }
 
@@ -1458,7 +1463,7 @@ namespace EmbyNoShare.Runtime
         // Codificación de la intro
 
         /// Argumentos de ffmpeg para la intro en el formato del canal, o null si no hay codificador para él
-        static string EncoderArguments(State st, JsonElement[] streams, string intro)
+        static string EncoderArguments(State st, JsonElement[] streams, string intro, double? seconds)
         {
             JsonElement? video = null;
             var audios = new List<string>();     // argumentos por pista de audio
@@ -1570,6 +1575,7 @@ namespace EmbyNoShare.Runtime
                 b.Append(" -streamid ").Append((i + 1).ToString(CultureInfo.InvariantCulture)).Append(':').Append(audioPids[i].ToString(CultureInfo.InvariantCulture));
             b.Append(" -mpegts_pmt_start_pid ").Append(st.IntroPmtPid.ToString(CultureInfo.InvariantCulture));
             if (latm) b.Append(" -mpegts_flags latm");
+            if (seconds != null) b.Append(" -t ").Append(seconds.Value.ToString(CultureInfo.InvariantCulture));
             b.Append(" -muxdelay 0 -muxpreload 0 -f mpegts pipe:1");
             return b.ToString();
         }
