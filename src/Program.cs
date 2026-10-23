@@ -1483,6 +1483,8 @@ static Action? PrepareLiveHlsRestart(ModuleDefinition module)
         || exited.Parameters[1].ParameterType.Name != "TranscodingJob" || exited.Parameters[2].ParameterType.Name != "StreamState")
         throw new Exception("Firmas inesperadas en la conversión HLS");
     var waitMove = GetMoveNext(module.GetType("Emby.Server.MediaEncoding.Api.Hls.BaseHlsService"), "WaitForMinimumSegmentCount");
+    var waitStub = FindMethod(module, "Emby.Server.MediaEncoding.Api.Hls.BaseHlsService", "WaitForMinimumSegmentCount", 3);
+    if (waitStub.ReturnType.FullName != "System.Threading.Tasks.Task") throw new Exception("Firma inesperada de WaitForMinimumSegmentCount");
     var waitCalls = waitMove.Body.Instructions.Where(i => (i.OpCode == OpCodes.Callvirt || i.OpCode == OpCodes.Call)
         && i.Operand is MethodReference m && m.Name == "GetCompletedSegments" && m.DeclaringType.Name == "TranscodingJob").ToList();
     if (waitCalls.Count == 0) throw new Exception("No se encuentra GetCompletedSegments en WaitForMinimumSegmentCount");
@@ -1503,7 +1505,13 @@ static Action? PrepareLiveHlsRestart(ModuleDefinition module)
         var pl = playlist.Body.GetILProcessor();
         Prologue(playlist, pl.Create(OpCodes.Ldarg_0), pl.Create(OpCodes.Ldarg_2), pl.Create(OpCodes.Ldarg_1), pl.Create(OpCodes.Call, current),
             pl.Create(OpCodes.Castclass, playlist.Parameters[1].ParameterType), pl.Create(OpCodes.Starg_S, playlist.Parameters[1]));
-        // WaitForMinimumSegmentCount: job.GetCompletedSegments() -> LiveRestart.CompletedSegments(job)
+        // WaitForMinimumSegmentCount: var t = LiveRestart.WaitSegments(job, count, ct); if (t != null) return t;
+        var waitHook = Injector.Method(rt, "WaitSegments", 3);
+        var wp = waitStub.Body.GetILProcessor();
+        var waitPop = wp.Create(OpCodes.Pop);
+        Prologue(waitStub, wp.Create(OpCodes.Ldarg_1), wp.Create(OpCodes.Ldarg_2), wp.Create(OpCodes.Ldarg_3), wp.Create(OpCodes.Call, waitHook),
+            wp.Create(OpCodes.Dup), wp.Create(OpCodes.Brfalse, waitPop), wp.Create(OpCodes.Ret), waitPop);
+        // (y si no es TV en directo) job.GetCompletedSegments() -> LiveRestart.CompletedSegments(job)
         foreach (var call in waitCalls)
         {
             var returnType = ((MethodReference)call.Operand).ReturnType;

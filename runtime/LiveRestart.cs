@@ -436,6 +436,49 @@ namespace EmbyNoShare.Runtime
 
         static object Manager;
 
+        /// BaseHlsService.WaitForMinimumSegmentCount en TV en directo (null fuera de ella): espera a los segmentos de la
+        /// conversión vigente, contando también los ficheros ya escritos en su carpeta, y nunca más de 30 s
+        public static Task WaitSegments(object job, int count, CancellationToken ct)
+        {
+            try
+            {
+                var state = job == null ? null : Reflect.Get(job, "OriginalState");
+                if (state == null || Reflect.Get(state, "LiveStream") == null) return null;
+            }
+            catch { return null; }
+            return Task.Run(() =>
+            {
+                var start = DateTime.UtcNow;
+                Log(job, "Waiting for " + count.ToString(CultureInfo.InvariantCulture) + " segments in " + Reflect.Get(job, "Path"));
+                while (!ct.IsCancellationRequested && (DateTime.UtcNow - start).TotalSeconds < 30)
+                {
+                    try
+                    {
+                        var current = Latest(job);
+                        var reported = 0;
+                        foreach (var item in (Array)CompletedSegments(current))
+                            if (Reflect.Get(Reflect.Get(item, "Value"), "SegmentType")?.ToString() == "Media") reported++;
+                        if (reported >= count) break;
+                        // en disco: los segmentos terminados (el último puede estar escribiéndose)
+                        var path = Reflect.Get(current, "Path") as string;
+                        var dir = Path.GetDirectoryName(path ?? "") ?? "";
+                        var stem = Path.GetFileNameWithoutExtension(path ?? "");
+                        if (Directory.Exists(dir))
+                        {
+                            var files = 0;
+                            foreach (var f in Directory.GetFiles(dir, stem + "_*"))
+                                if (!f.EndsWith(".m3u8", StringComparison.OrdinalIgnoreCase) && new FileInfo(f).Length > 0) files++;
+                            if (files > count) break;
+                        }
+                    }
+                    catch { }
+                    Thread.Sleep(100);
+                }
+                Log(job, "Finished waiting for " + count.ToString(CultureInfo.InvariantCulture) + " segments in " + Reflect.Get(job, "Path")
+                         + " (" + ((int)(DateTime.UtcNow - start).TotalMilliseconds).ToString(CultureInfo.InvariantCulture) + " ms)");
+            });
+        }
+
         /// BaseHlsService.GetLivePlaylistText: la conversión vigente; si la petición llega sin ella (otra petición
         /// simultánea la arrancó, o se está relanzando), la de su sesión, esperando un poco a que aparezca
         public static object CurrentJob(object service, object job, object state)

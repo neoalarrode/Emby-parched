@@ -1234,7 +1234,8 @@ namespace EmbyNoShare.Runtime
             // puente: más intro si a los lectores se les va a acabar lo publicado y, con el origen ya en marcha, si además
             // lleva un rato sin mandar nada (si manda, su trozo está al llegar)
             var lead = Lead(st);
-            var sourceRunning = st.RunKind == 2 && Late(st, (DateTime.UtcNow - st.LastActivity).TotalSeconds) < Math.Max(BridgeIdle, 1.5 * st.BurstGap);
+            // Late ya descuenta lo que una ráfaga trajo por delante: basta un margen pequeño sobre cuando debía llegar más
+            var sourceRunning = st.RunKind == 2 && Late(st, (DateTime.UtcNow - st.LastActivity).TotalSeconds) < BridgeIdle;
             if (st.OutStarted && lead < LowLead && !sourceRunning)
             {
                 // lo que ya llegó del trozo a medias va antes que la intro
@@ -1350,7 +1351,7 @@ namespace EmbyNoShare.Runtime
             var idle = (DateTime.UtcNow - st.LastActivity).TotalSeconds;
             // tras un intento fallido, el siguiente a los 3 s; si no, cuenta lo que el origen va con retraso respecto a lo que
             // ya ha mandado (tras una ráfaga de 12 s no va tarde hasta pasados esos 12 s)
-            if (st.GenFailures > 0 ? idle < 3 : Late(st, idle) < Math.Max(Stall, 3 * st.BurstGap + 2)) return;
+            if (st.GenFailures > 0 ? idle < 3 : Late(st, idle) < Stall) return;
             Log(st.Source, "Puente: " + ((int)idle).ToString(CultureInfo.InvariantCulture) + " s sin datos del origen, se abre otra conexión");
             RestartGen(st, 0);
         }
