@@ -77,6 +77,13 @@
 //     BaseHlsService.GetLivePlaylistText (HLS convertido con ffmpeg) era una playlist EVENT que nunca borraba
 //     segmentos. Ahora solo lista los últimos EMBY_LIVE_HLS_WINDOW_MINUTES (por defecto 30; 0 = original), sin
 //     EVENT y con MEDIA-SEQUENCE igual a los segmentos descartados, y borra del disco los que salen de la ventana.
+// Emby.LiveTV.dll
+//   live-fast-open (marcador EmbyNoShare.LiveFastOpen):
+//     SharedHttpPipelineSource.OpenInternal: al abrir un canal, Emby trocea lo recibido en segmentos internos de
+//     3 s (a ritmo real) y no da el canal por abierto (ffprobe y respuesta al cliente) hasta tener 2 completos:
+//     ~7-8 s de espera aunque la fuente (p. ej. la intro de Dispatcharr) llegue al instante. Ahora los segmentos
+//     duran EMBY_LIVE_SEGMENT_SECONDS (por defecto 1; 3 = original) y se espera a EMBY_LIVE_OPEN_SEGMENTS (por
+//     defecto 1; 2 = original). La duración de segmento también la usan las conversiones a HLS de esos canales.
 //
 // Uso: EmbyNoShare <ruta/Emby.LiveTV.dll | ruta/Emby.Server.MediaEncoding.dll | ruta/plugin.dll | ...> [--check]
 //   --check: 0 = hay parches pendientes y todos los patrones coinciden, 3 = nada que hacer
@@ -113,6 +120,7 @@ var patches = new (string Assembly, string Marker, string Name, Func<ModuleDefin
     ("Emby.LiveTV", "LiveIdleClose", "live-idle-close", PrepareLiveIdleClose),
     ("Emby.LiveTV", "LiveReconnectFactor", "live-reconnect-factor", PrepareLiveReconnectFactor),
     ("Emby.Server.MediaEncoding", "LiveHlsWindow", "live-hls-window", PrepareLiveHlsWindow),
+    ("Emby.LiveTV", "LiveFastOpen", "live-fast-open", PrepareLiveFastOpen),
 };
 
 var applicable = patches.Where(x => x.Assembly == asm.Name.Name).ToList();
@@ -1393,4 +1401,82 @@ static VariableDefinition? StoredLocal(MethodDefinition method, Instruction ins)
     if (ins.OpCode == OpCodes.Stloc_2) return vars[2];
     if (ins.OpCode == OpCodes.Stloc_3) return vars[3];
     return ins.Operand as VariableDefinition;
+}
+
+static Action? PrepareLiveFastOpen(ModuleDefinition module)
+{
+    var source = module.GetType("Emby.LiveTV.TunerHosts.SharedHttpPipelineSource") ?? throw new Exception("No se encuentra SharedHttpPipelineSource");
+    var moveNext = GetMoveNext(source, "OpenInternal");
+    var ins = moveNext.Body.Instructions;
+    // SegmentDuration = SupportsPlaybackSegments ? TimeSpan.FromSeconds(3.0) : TimeSpan.FromMinutes(1.0)
+    var seconds = ins.Where(i => i.OpCode == OpCodes.Ldc_R8 && (double)i.Operand == 3.0
+        && i.Next.Operand is MethodReference f && f.Name == "FromSeconds"
+        && i.Next.Next.Operand is MethodReference set && set.Name == "set_SegmentDuration").ToList();
+    // for (numSegments = GetSegments().Count; numSegments < 2; ...)
+    var count = ins.Where(i => i.OpCode == OpCodes.Ldc_I4_2
+        && i.Previous.Operand is FieldReference fr && fr.Name.Contains("numSegments")
+        && (i.Next.OpCode == OpCodes.Blt || i.Next.OpCode == OpCodes.Blt_S)).ToList();
+    if (seconds.Count != 1 || count.Count != 1)
+        throw new Exception($"Patrón inesperado en SharedHttpPipelineSource.OpenInternal ({seconds.Count}, {count.Count})");
+    Console.WriteLine($"[live-fast-open] {moveNext.FullName}");
+
+    return () =>
+    {
+        var segmentSeconds = EnvInt(module, source, "EmbyNoShare_SegmentSeconds", "EMBY_LIVE_SEGMENT_SECONDS", 1, 3, 1, 10);
+        var openSegments = EnvInt(module, source, "EmbyNoShare_OpenSegments", "EMBY_LIVE_OPEN_SEGMENTS", 1, 2, 1, 10);
+        // Se cambia la instrucción en el sitio (es destino de un salto): ldc.r8 3 -> call; conv.r8
+        var s = seconds[0];
+        s.OpCode = OpCodes.Call;
+        s.Operand = segmentSeconds;
+        moveNext.Body.GetILProcessor().InsertAfter(s, Instruction.Create(OpCodes.Conv_R8));
+        var c = count[0];
+        c.OpCode = OpCodes.Call;
+        c.Operand = openSegments;
+    };
+}
+
+/// static int Name(): entero de la variable de entorno; sin definir -> byDefault; fuera de [min, max] o no numérica -> original
+static MethodDefinition EnvInt(ModuleDefinition module, TypeDefinition owner, string name, string variable, int byDefault, int original, int min, int max)
+{
+    var ts = module.TypeSystem;
+    var getEnv = Bcl(module, ts.CoreLibrary, "System.Environment", "GetEnvironmentVariable", false, ts.String, ts.String);
+    var int32 = new TypeReference("System", "Int32", module, ts.CoreLibrary, valueType: true);
+    var tryParse = new MethodReference("TryParse", ts.Boolean, int32) { HasThis = false };
+    tryParse.Parameters.Add(new ParameterDefinition(ts.String));
+    tryParse.Parameters.Add(new ParameterDefinition(new ByReferenceType(ts.Int32)));
+
+    var method = new MethodDefinition(name, MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig, ts.Int32);
+    var s = new VariableDefinition(ts.String);
+    var v = new VariableDefinition(ts.Int32);
+    method.Body.Variables.Add(s);
+    method.Body.Variables.Add(v);
+    method.Body.InitLocals = true;
+    var h = method.Body.GetILProcessor();
+    var useDefault = h.Create(OpCodes.Ldc_I4, byDefault);
+    var useOriginal = h.Create(OpCodes.Ldc_I4, original);
+    var parse = h.Create(OpCodes.Ldloc, s);
+    h.Append(h.Create(OpCodes.Ldstr, variable));
+    h.Append(h.Create(OpCodes.Call, getEnv));
+    h.Append(h.Create(OpCodes.Stloc, s));
+    h.Append(h.Create(OpCodes.Ldloc, s));
+    h.Append(h.Create(OpCodes.Brtrue, parse));
+    h.Append(useDefault);
+    h.Append(h.Create(OpCodes.Ret));
+    h.Append(parse);
+    h.Append(h.Create(OpCodes.Ldloca, v));
+    h.Append(h.Create(OpCodes.Call, tryParse));
+    h.Append(h.Create(OpCodes.Brfalse, useOriginal));
+    h.Append(h.Create(OpCodes.Ldloc, v));
+    h.Append(h.Create(OpCodes.Ldc_I4, min));
+    h.Append(h.Create(OpCodes.Blt, useOriginal));
+    h.Append(h.Create(OpCodes.Ldloc, v));
+    h.Append(h.Create(OpCodes.Ldc_I4, max));
+    h.Append(h.Create(OpCodes.Bgt, useOriginal));
+    h.Append(h.Create(OpCodes.Ldloc, v));
+    h.Append(h.Create(OpCodes.Ret));
+    h.Append(useOriginal);
+    h.Append(h.Create(OpCodes.Ret));
+    method.Body.OptimizeMacros();
+    owner.Methods.Add(method);
+    return method;
 }

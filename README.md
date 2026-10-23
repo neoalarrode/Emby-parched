@@ -14,6 +14,7 @@ Parches para Emby Server (probados con 4.10.2.0 y 4.11.0.9):
 5. **Pista de audio según el idioma del perfil** en canales con varias pistas (`esp`, `ads`, `qaa`…).
 6. **Robustez de la TV en directo**: abrir un canal no bloquea al resto, cierre de streams huérfanos,
    reconexiones más tolerantes con el proveedor y ventana deslizante en el HLS convertido (disco acotado).
+7. **Apertura rápida de canales**: Emby da el canal por abierto en ~1 s en vez de ~8 s.
 
 El parcheador aplica solo los parches que falten (y omite los que la versión de Emby ya no necesita), así que se puede ejecutar sobre una instalación ya parcheada.
 
@@ -158,6 +159,21 @@ Variables (en `/etc/emby-server.conf`, reiniciando `emby-server` después):
     EMBY_LIVE_IDLE_MINUTES=20          # minutos sin lectores para cerrar un stream; 0 lo desactiva
     EMBY_LIVE_RECONNECT_FACTOR=5       # multiplica los límites de reconexión; 1 = los de Emby
     EMBY_LIVE_HLS_WINDOW_MINUTES=30    # minutos que conserva el HLS convertido; 0 = sin límite (original)
+
+## Parche 7: apertura rápida de canales (`Emby.LiveTV.dll`)
+
+Al abrir un canal, `SharedHttpPipelineSource.OpenInternal` trocea lo que llega en segmentos internos de 3 s
+(se rellenan a ritmo real) y no da el canal por abierto (ffprobe y respuesta al cliente) hasta tener **2
+completos**: unos 7–8 s con el reproductor en "cargando", aunque la fuente llegue al instante (por ejemplo, la
+intro de Dispatcharr). En el log: `Done waiting for 2 segments after 7xxxms` y `Live stream opened after 7898ms`.
+
+Con el parche los segmentos internos duran 1 s y basta con 1: el canal se abre en ~1 s. Esa duración también la
+usan las conversiones a HLS de esos canales (segmentos de 1 s), con lo que el cliente empieza antes.
+
+Variables (en `/etc/emby-server.conf`, reiniciando `emby-server` después):
+
+    EMBY_LIVE_SEGMENT_SECONDS=1        # duración de los segmentos internos (1-10); 3 = original
+    EMBY_LIVE_OPEN_SEGMENTS=1          # segmentos completos antes de dar el canal por abierto (1-10); 2 = original
 
 ## Instalación
 
