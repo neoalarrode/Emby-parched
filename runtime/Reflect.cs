@@ -37,7 +37,7 @@ namespace EmbyNoShare.Runtime
         {
             for (var t = target.GetType(); t != null; t = t.BaseType)
             {
-                foreach (var m in t.GetMethods(All | BindingFlags.DeclaredOnly))
+                foreach (var m in t.GetMethods(All | BindingFlags.Static | BindingFlags.DeclaredOnly))
                 {
                     if (m.Name != name || m.IsGenericMethodDefinition) continue;
                     var ps = m.GetParameters();

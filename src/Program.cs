@@ -85,6 +85,13 @@
 //     ya convertido, continúa la numeración de segmentos y añade #EXT-X-DISCONTINUITY. EMBY_LIVE_RESTART=0 lo
 //     desactiva. La lógica está en runtime/ (LiveRestart, LiveInput), que se copia dentro de las DLL.
 //
+//   live-intro (Emby.LiveTV.dll, EmbyNoShare.LiveIntro): con EMBY_LIVE_INTRO (ruta de un vídeo o imagen), abrir un
+//     canal MPEG-TS ya no espera a llenar el buffer. En cuanto llegan la tabla de pistas y el primer fotograma clave,
+//     Emby analiza ese trozo y responde con el formato real, y su ffmpeg codifica la intro en ese mismo formato
+//     (códec, parámetros, PID y tabla de pistas del canal) y la mete en el buffer, con marcas de tiempo seguidas,
+//     hasta que el canal tiene un trozo en ese instante; entonces se recorta la intro y sigue el canal sin cortes.
+//     SharedHttpPipelineSource: OpenInternal, OnSegmentStarted y OnSegmentCompleted (runtime/LiveIntro).
+//
 // Uso: EmbyNoShare <ruta/Emby.LiveTV.dll | ruta/Emby.Server.MediaEncoding.dll | ruta/plugin.dll | ...> [--check]
 //   --check: 0 = hay parches pendientes y todos los patrones coinciden, 3 = nada que hacer
 using Mono.Cecil;
@@ -122,6 +129,7 @@ var patches = new (string Assembly, string Marker, string Name, Func<ModuleDefin
     ("Emby.Server.MediaEncoding", "LiveHlsWindow", "live-hls-window", PrepareLiveHlsWindow),
     ("Emby.Server.MediaEncoding", "LiveHlsRestart", "live-hls-restart", PrepareLiveHlsRestart),
     ("Emby.LiveTV", "LiveStartAt", "live-start-at", PrepareLiveStartAt),
+    ("Emby.LiveTV", "LiveIntro", "live-intro", PrepareLiveIntro),
 };
 
 var applicable = patches.Where(x => x.Assembly == asm.Name.Name).ToList();
@@ -1494,5 +1502,44 @@ static Action? PrepareLiveStartAt(ModuleDefinition module)
         Prologue(getSegment, p.Create(OpCodes.Ldarg_0), p.Create(OpCodes.Callvirt, files), p.Create(OpCodes.Ldarg_0),
             p.Create(OpCodes.Call, pick), p.Create(OpCodes.Dup), p.Create(OpCodes.Brfalse, pop),
             p.Create(OpCodes.Castclass, getSegment.ReturnType), p.Create(OpCodes.Ret), pop);
+    };
+}
+
+static Action? PrepareLiveIntro(ModuleDefinition module)
+{
+    const string pipe = "Emby.LiveTV.TunerHosts.SharedHttpPipelineSource";
+    var open = FindMethod(module, pipe, "OpenInternal", 1);
+    var started = FindMethod(module, pipe, "OnSegmentStarted", 1);
+    var completed = FindMethod(module, pipe, "OnSegmentCompleted", 1);
+    if (open.ReturnType.FullName != "System.Threading.Tasks.Task" || open.Parameters[0].ParameterType.FullName != "System.Threading.CancellationToken"
+        || started.Parameters[0].ParameterType.Name != "SegmentedStreamSegmentInfo" || completed.Parameters[0].ParameterType.Name != "SegmentedStreamSegmentInfo")
+        throw new Exception("Firmas inesperadas en SharedHttpPipelineSource");
+    foreach (var member in new[] { "OpenStream", "StartStreaming", "IsBufferingSupported", "IsHls", "GetSegments", "GetStreamFiles" })
+        if (!module.GetType(pipe).Methods.Any(m => m.Name == member)) throw new Exception("No se encuentra SharedHttpPipelineSource." + member);
+    foreach (var member in new[] { "_supportsCopyTo", "BufferLimit", "TempFilePath", "CompletedSegmentFiles", "CurrentWritingFile", "_config", "_appHost" })
+        if (!module.GetType(pipe).Fields.Any(f => f.Name == member)) throw new Exception("No se encuentra SharedHttpPipelineSource." + member);
+    Console.WriteLine($"[live-intro] {open.FullName}, {started.FullName}, {completed.FullName}");
+
+    return () =>
+    {
+        var rt = Injector.Ensure(module, "LiveIntro");
+        var openHook = Injector.Method(rt, "Open", 2);
+        var hold = Injector.Method(rt, "Hold", 3);
+
+        // OpenInternal: var t = LiveIntro.Open(this, ct); if (t != null) return t;
+        var p = open.Body.GetILProcessor();
+        var original = open.Body.Instructions[0];
+        var pop = p.Create(OpCodes.Pop);
+        Prologue(open, p.Create(OpCodes.Ldarg_0), p.Create(OpCodes.Ldarg_1), p.Create(OpCodes.Call, openHook),
+            p.Create(OpCodes.Dup), p.Create(OpCodes.Brfalse, pop), p.Create(OpCodes.Ret), pop);
+
+        // OnSegmentStarted / OnSegmentCompleted: if (LiveIntro.Hold(this, file, started)) return;
+        foreach (var (method, isStart) in new[] { (started, true), (completed, false) })
+        {
+            var q = method.Body.GetILProcessor();
+            var first = method.Body.Instructions[0];
+            Prologue(method, q.Create(OpCodes.Ldarg_0), q.Create(OpCodes.Ldarg_1), q.Create(isStart ? OpCodes.Ldc_I4_1 : OpCodes.Ldc_I4_0),
+                q.Create(OpCodes.Call, hold), q.Create(OpCodes.Brfalse, first), q.Create(OpCodes.Ret));
+        }
     };
 }
