@@ -6,6 +6,12 @@
 #                                     de audio por idioma (alias esp..., audiodescripción al final, TV en directo)
 #   plugins Emby.XmlTV.dll y Emby.M3UTuner.dll (si están instalados) -> borrar las copias
 #                                     antiguas de la guía XMLTV en cada actualización
+#   Subtítulos en TV en directo (MediaEncoding): la emisión lleva desde el principio los subtítulos del canal
+#                                     y la lista de subtítulos encuentra su conversión (sin 404 al activarlos)
+#                                     y, si aún no la hay, contesta al instante con una lista vacía con las mismas
+#                                     cabeceras que la real (sin esperar 20 s y sin que iPhone/Apple TV la descarten);
+#                                     los subtítulos gráficos (DVB) se convierten a texto por OCR en la lista HLS
+#                                     y los DVB sin idioma lo toman de su página (Intro Relay lo pone ahí)
 #   Robustez de la TV en directo: aperturas sin bloqueo global (Implementations), cierre de streams
 #                                     huérfanos y reconexiones más tolerantes (LiveTV), ventana deslizante
 #                                     en el HLS convertido (MediaEncoding)
