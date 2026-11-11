@@ -3,6 +3,7 @@
 # Requiere el SDK de .NET 8. Salida: bin/linux-x64/EmbyNoShare y bin/linux-arm64/EmbyNoShare
 set -e
 DIR="$(cd "$(dirname "$0")" && pwd)"
+dotnet build "$DIR/helpers" -c Release -o "$DIR/helpers/out"
 for r in linux-x64 linux-arm64; do
   dotnet publish "$DIR/src" -c Release -r "$r" --self-contained \
     -p:PublishSingleFile=true -p:PublishTrimmed=true -p:TrimMode=partial \

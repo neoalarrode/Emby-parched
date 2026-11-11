@@ -142,6 +142,7 @@ var patches = new (string Assembly, string Marker, string Name, Func<ModuleDefin
     ("Emby.Server.MediaEncoding", "SubtitlesOcrKeepCodec", "subtitles-ocr-keep-codec", PrepareSubtitlesOcrKeepCodec),
     ("Emby.Server.MediaEncoding", "LiveSubtitlesNoWait", "live-subtitles-nowait", PrepareLiveSubtitlesNoWait),
     ("Emby.Server.MediaEncoding", "LiveSubtitlesHeaders", "live-subtitles-headers", PrepareLiveSubtitlesHeaders),
+    ("Emby.Server.MediaEncoding", "LiveSubtitlesList", "live-subtitles-list", PrepareLiveSubtitlesList),
     ("Emby.Server.MediaEncoding", "DvbSubtitleLanguage", "dvb-subtitle-language", PrepareDvbSubtitleLanguage),
 };
 
@@ -2033,6 +2034,247 @@ static Action? PrepareDvbSubtitleLanguage(ModuleDefinition module)
     };
 }
 
+
+// Copia en `module` los métodos estáticos de un tipo de EmbyNoShareHelpers.dll (recurso incrustado; código que solo usa
+// la biblioteca estándar) como un tipo nuevo `EmbyNoShare.<name>`. Devuelve los métodos copiados por nombre.
+static Dictionary<string, MethodDefinition> CopyHelpers(ModuleDefinition module, string typeName, string name)
+{
+    using var stream = typeof(Program).Assembly.GetManifestResourceStream("EmbyNoShareHelpers.dll")
+        ?? throw new Exception("Falta el recurso EmbyNoShareHelpers.dll");
+    var bytes = new MemoryStream();
+    stream.CopyTo(bytes);
+    bytes.Position = 0;
+    var source = ModuleDefinition.ReadModule(bytes);
+    var from = source.GetType(typeName) ?? throw new Exception("No se encuentra " + typeName + " en EmbyNoShareHelpers.dll");
+    var to = new TypeDefinition("EmbyNoShare", name, TypeAttributes.NotPublic | TypeAttributes.Abstract | TypeAttributes.Sealed | TypeAttributes.BeforeFieldInit,
+        module.TypeSystem.Object);
+    module.Types.Add(to);
+    var map = new Dictionary<MethodDefinition, MethodDefinition>();
+    foreach (var m in from.Methods.Where(m => m.IsStatic && !m.IsConstructor))
+    {
+        var copy = new MethodDefinition(m.Name, MethodAttributes.Assembly | MethodAttributes.Static | MethodAttributes.HideBySig, module.ImportReference(m.ReturnType));
+        foreach (var prm in m.Parameters)
+            copy.Parameters.Add(new ParameterDefinition(prm.Name, prm.Attributes, module.ImportReference(prm.ParameterType)));
+        to.Methods.Add(copy);
+        map[m] = copy;
+    }
+    foreach (var (m, copy) in map)
+    {
+        var body = copy.Body;
+        body.InitLocals = m.Body.InitLocals;
+        body.MaxStackSize = m.Body.MaxStackSize;
+        var vars = m.Body.Variables.ToDictionary(v => v, v => new VariableDefinition(module.ImportReference(v.VariableType)));
+        foreach (var v in m.Body.Variables) body.Variables.Add(vars[v]);
+        var ins = new Dictionary<Instruction, Instruction>();
+        foreach (var i in m.Body.Instructions)
+        {
+            object? operand = i.Operand switch
+            {
+                MethodDefinition d when map.TryGetValue(d, out var local) => local,
+                MethodReference r when r.DeclaringType.Scope == source
+                    => throw new Exception("El código copiado usa un tipo propio: " + r.FullName),
+                MethodReference r => module.ImportReference(r),
+                FieldReference f when f.DeclaringType.Scope == source => throw new Exception("El código copiado no puede usar campos propios: " + f.FullName),
+                FieldReference f => module.ImportReference(f),
+                TypeReference t => module.ImportReference(t),
+                VariableDefinition v => vars[v],
+                ParameterDefinition prm => copy.Parameters[prm.Index],
+                Instruction or Instruction[] => null,
+                CallSite => throw new Exception("El código copiado no puede usar calli"),
+                _ => i.Operand,
+            };
+            var n = Instruction.Create(OpCodes.Nop);
+            n.OpCode = i.OpCode;
+            n.Operand = operand;
+            ins[i] = n;
+            body.Instructions.Add(n);
+        }
+        foreach (var i in m.Body.Instructions)
+        {
+            if (i.Operand is Instruction t) ins[i].Operand = ins[t];
+            else if (i.Operand is Instruction[] ts) ins[i].Operand = ts.Select(x => ins[x]).ToArray();
+        }
+        foreach (var eh in m.Body.ExceptionHandlers)
+            body.ExceptionHandlers.Add(new ExceptionHandler(eh.HandlerType)
+            {
+                TryStart = ins[eh.TryStart], TryEnd = eh.TryEnd == null ? null : ins[eh.TryEnd],
+                HandlerStart = ins[eh.HandlerStart], HandlerEnd = eh.HandlerEnd == null ? null : ins[eh.HandlerEnd],
+                FilterStart = eh.FilterStart == null ? null : ins[eh.FilterStart],
+                CatchType = eh.CatchType == null ? null : module.ImportReference(eh.CatchType),
+            });
+    }
+    return map.Values.ToDictionary(m => m.Name, m => m);
+}
+
+// La lista de subtítulos en directo la hace Emby, no ffmpeg. ffmpeg solo cierra un segmento de subtítulos cuando llega
+// la frase siguiente, así que su lista va por detrás del vídeo, con segmentos de 0 s y otros de 6 s, y se queda parada
+// mientras nadie habla: los reproductores se saltan frases (web) o descartan la pista (iPhone, Apple TV, que además la
+// piden antes que el vídeo y recibían una lista vacía). Ahora:
+//  - si aún no hay conversión, la lista de subtítulos la arranca (pide a Emby la lista de vídeo de la misma sesión);
+//  - la lista lleva un segmento de SubtitleSegmentLength s por cada tanto de vídeo convertido (menos uno de margen), con
+//    los nombres de segmento de ffmpeg, ventana deslizante y siempre las mismas cabeceras;
+//  - un segmento que ffmpeg aún no ha cerrado se sirve con lo que lleve escrito, y uno que no existe, en blanco.
+static Action? PrepareLiveSubtitlesList(ModuleDefinition module)
+{
+    var service = module.GetType("Emby.Server.MediaEncoding.Api.Hls.BaseHlsService") ?? throw new Exception("No se encuentra BaseHlsService");
+    var stub = service.Methods.SingleOrDefault(m => m.Name == "Get" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.Name == "GetLiveSubtitlePlaylist")
+        ?? throw new Exception("No se encuentra Get(GetLiveSubtitlePlaylist)");
+    var sms = service.NestedTypes.Where(t => t.Name.StartsWith("<Get>") && t.Fields.Any(f => f.Name == "request" && f.FieldType.Name == "GetLiveSubtitlePlaylist")).ToList();
+    if (sms.Count != 1) throw new Exception($"Se esperaba 1 state machine de Get(GetLiveSubtitlePlaylist), hay {sms.Count}");
+    var il = sms[0].Methods.Single(m => m.Name == "MoveNext").Body.Instructions;
+    MethodReference Ref(Func<MethodReference, bool> f, string what) =>
+        il.Select(i => i.Operand).OfType<MethodReference>().FirstOrDefault(f) ?? throw new Exception("No se encuentra " + what);
+    var getResult = Ref(m => m.Name == "GetResult" && m.Parameters.Count == 4, "GetResult");
+    var asSpan = Ref(m => m.Name == "AsSpan" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.FullName == "System.String", "AsSpan(string)");
+    var getMime = Ref(m => m.Name == "GetMimeType" && m.Parameters.Count == 1, "GetMimeType");
+    var dictCtor = Ref(m => m.Name == ".ctor" && m.DeclaringType.Name.StartsWith("Dictionary`2") && m.Parameters.Count == 1, "Dictionary(IEqualityComparer)");
+    var ignoreCase = Ref(m => m.Name == "get_OrdinalIgnoreCase", "StringComparer.OrdinalIgnoreCase");
+    var getRf = Ref(m => m.Name == "get_ResultFactory", "ResultFactory");
+    var getReq = Ref(m => m.Name == "get_Request" && m.HasThis && m.Parameters.Count == 0, "Request");
+    var getRaw = Ref(m => m.Name == "get_RawUrl", "Request.RawUrl");
+    var getFs = Ref(m => m.Name == "get_FileSystem", "FileSystem");
+    var getEm = Ref(m => m.Name == "get_EncodingManager", "EncodingManager");
+    var pathFn = Ref(m => m.Name == "GetSubtitleVariantPlaylistPath", "GetSubtitleVariantPlaylistPath");
+    var reqIdx = Ref(m => m.Name == "get_CurrentSubtitleStreamIndex", "CurrentSubtitleStreamIndex");
+    var reqLen = Ref(m => m.Name == "get_SubtitleSegmentLength", "SubtitleSegmentLength");
+    // ApplicationHost es de BaseApiService (otra DLL): la referencia que ya usa el propio ensamblado
+    var getHost = module.GetMemberReferences().OfType<MethodReference>().FirstOrDefault(m => m.Name == "get_ApplicationHost" && m.HasThis
+        && m.Parameters.Count == 0 && m.ReturnType.FullName == "MediaBrowser.Controller.IServerApplicationHost")
+        ?? throw new Exception("No se encuentra ApplicationHost");
+    var hostType = getHost.ReturnType;
+    if (hostType.FullName != "MediaBrowser.Controller.IServerApplicationHost") throw new Exception("ApplicationHost no es IServerApplicationHost: " + hostType.FullName);
+    var getPort = new MethodReference("get_HttpPort", module.TypeSystem.Int32, hostType) { HasThis = true };
+    if (hostType.Resolve()?.Properties.Any(p => p.Name == "HttpPort" && p.PropertyType.FullName == "System.Int32") != true)
+        throw new Exception("No se encuentra IServerApplicationHost.HttpPort");
+    var manager = module.GetType("Emby.Server.MediaEncoding.Api.EncodingManager") ?? throw new Exception("No se encuentra EncodingManager");
+    var getJob = manager.Methods.Single(m => m.Name == "GetTranscodingJob" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.FullName == "System.String");
+    var jobType = getJob.ReturnType.Resolve() ?? throw new Exception("No se resuelve TranscodingJob");
+    var jobPath = jobType.Properties.Single(p => p.Name == "Path").GetMethod;
+    var reqType = stub.Parameters[0].ParameterType.Resolve();
+    var playSession = (reqType.Properties.Concat(reqType.BaseType.Resolve().Properties)).First(p => p.Name == "PlaySessionId").GetMethod;
+    var dynamic = module.GetType("Emby.Server.MediaEncoding.Api.Hls.DynamicHlsService") ?? throw new Exception("No se encuentra DynamicHlsService");
+    var segText = dynamic.Methods.SingleOrDefault(m => m.Name == "GetSubtitleSegmentText" && m.IsStatic && m.Parameters.Count >= 2
+        && m.Parameters[1].ParameterType.FullName == "System.String" && m.Parameters[1].Name == "segmentPath")
+        ?? throw new Exception("No se encuentra DynamicHlsService.GetSubtitleSegmentText(fileSystem, segmentPath, ...)");
+    if (stub.ReturnType is not GenericInstanceType taskOfObject || taskOfObject.GenericArguments[0].FullName != "System.Object")
+        throw new Exception("Get(GetLiveSubtitlePlaylist) no devuelve Task<object>");
+    Console.WriteLine($"[live-subtitles-list] {stub.FullName}, {segText.FullName}");
+
+    return () =>
+    {
+        var ts = module.TypeSystem;
+        var code = CopyHelpers(module, "EmbyNoShare.LiveSubtitlesCode", "LiveSubtitlesCode");
+        var find = manager.Methods.SingleOrDefault(m => m.Name == "EmbyNoShare_FindLiveJob");
+        var scope = ts.String.Scope;
+        var taskType = new TypeReference("System.Threading.Tasks", "Task", module, scope, valueType: false);
+        var fromResult = new MethodReference("FromResult", ts.Void, taskType) { HasThis = false };
+        var tp = new GenericParameter("TResult", fromResult);
+        fromResult.GenericParameters.Add(tp);
+        var retType = new GenericInstanceType(taskOfObject.ElementType);
+        retType.GenericArguments.Add(tp);
+        fromResult.ReturnType = retType;
+        fromResult.Parameters.Add(new ParameterDefinition(tp));
+        var fromResultObj = new GenericInstanceMethod(fromResult);
+        fromResultObj.GenericArguments.Add(ts.Object);
+
+        // private static Task<object> EmbyNoShare_LiveSubtitles(BaseHlsService self, GetLiveSubtitlePlaylist req)
+        // {
+        //   var job = <buscar conversión>;
+        //   if (job == null) { LiveSubtitlesCode.StartJob(self.ApplicationHost.HttpPort, self.Request.RawUrl); job = <buscar conversión>; }
+        //   string video = null, subs = null;
+        //   if (job != null) { video = job.Path; subs = GetSubtitleVariantPlaylistPath(self.FileSystem, job.Path, req.CurrentSubtitleStreamIndex); }
+        //   string text = LiveSubtitlesCode.Build(video, subs, self.Request.RawUrl, req.SubtitleSegmentLength);
+        //   return Task.FromResult<object>(self.ResultFactory.GetResult(self.Request, text.AsSpan(), GetMimeType("playlist.m3u8"), new Dictionary<string,string>(OrdinalIgnoreCase)));
+        // }
+        var helper = new MethodDefinition("EmbyNoShare_LiveSubtitles", MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig, stub.ReturnType);
+        helper.Parameters.Add(new ParameterDefinition("self", ParameterAttributes.None, service));
+        helper.Parameters.Add(new ParameterDefinition("req", ParameterAttributes.None, stub.Parameters[0].ParameterType));
+        var vJob = new VariableDefinition(module.ImportReference(jobType));
+        var vVideo = new VariableDefinition(ts.String);
+        var vSubs = new VariableDefinition(ts.String);
+        foreach (var v in new[] { vJob, vVideo, vSubs }) helper.Body.Variables.Add(v);
+        helper.Body.InitLocals = true;
+        var h = helper.Body.GetILProcessor();
+        void FindJob()
+        {
+            h.Append(h.Create(OpCodes.Ldarg_0));
+            h.Append(h.Create(OpCodes.Callvirt, getEm));
+            h.Append(h.Create(OpCodes.Ldarg_1));
+            if (find != null)
+                h.Append(h.Create(OpCodes.Callvirt, find));
+            else
+            {
+                h.Append(h.Create(OpCodes.Callvirt, module.ImportReference(playSession)));
+                h.Append(h.Create(OpCodes.Callvirt, getJob));
+            }
+            h.Append(h.Create(OpCodes.Stloc, vJob));
+        }
+        var haveJob = h.Create(OpCodes.Ldloc, vJob);
+        var build = h.Create(OpCodes.Ldloc, vVideo);
+        FindJob();
+        h.Append(h.Create(OpCodes.Ldloc, vJob));
+        h.Append(h.Create(OpCodes.Brtrue, haveJob));
+        h.Append(h.Create(OpCodes.Ldarg_0));
+        h.Append(h.Create(OpCodes.Callvirt, getHost));
+        h.Append(h.Create(OpCodes.Callvirt, getPort));
+        h.Append(h.Create(OpCodes.Ldarg_0));
+        h.Append(h.Create(OpCodes.Callvirt, getReq));
+        h.Append(h.Create(OpCodes.Callvirt, getRaw));
+        h.Append(h.Create(OpCodes.Call, code["StartJob"]));
+        FindJob();
+        h.Append(haveJob);                                              // ldloc job
+        h.Append(h.Create(OpCodes.Brfalse, build));
+        h.Append(h.Create(OpCodes.Ldloc, vJob));
+        h.Append(h.Create(OpCodes.Callvirt, module.ImportReference(jobPath)));
+        h.Append(h.Create(OpCodes.Stloc, vVideo));
+        h.Append(h.Create(OpCodes.Ldarg_0));
+        h.Append(h.Create(OpCodes.Callvirt, getFs));
+        h.Append(h.Create(OpCodes.Ldloc, vVideo));
+        h.Append(h.Create(OpCodes.Ldarg_1));
+        h.Append(h.Create(OpCodes.Callvirt, reqIdx));
+        h.Append(h.Create(OpCodes.Call, pathFn));
+        h.Append(h.Create(OpCodes.Stloc, vSubs));
+        h.Append(build);                                                // ldloc video
+        h.Append(h.Create(OpCodes.Ldloc, vSubs));
+        h.Append(h.Create(OpCodes.Ldarg_0));
+        h.Append(h.Create(OpCodes.Callvirt, getReq));
+        h.Append(h.Create(OpCodes.Callvirt, getRaw));
+        h.Append(h.Create(OpCodes.Ldarg_1));
+        h.Append(h.Create(OpCodes.Callvirt, reqLen));
+        h.Append(h.Create(OpCodes.Call, code["Build"]));
+        h.Append(h.Create(OpCodes.Stloc, vVideo));
+        h.Append(h.Create(OpCodes.Ldarg_0));
+        h.Append(h.Create(OpCodes.Callvirt, getRf));
+        h.Append(h.Create(OpCodes.Ldarg_0));
+        h.Append(h.Create(OpCodes.Callvirt, getReq));
+        h.Append(h.Create(OpCodes.Ldloc, vVideo));
+        h.Append(h.Create(OpCodes.Call, asSpan));
+        h.Append(h.Create(OpCodes.Ldstr, "playlist.m3u8"));
+        h.Append(h.Create(OpCodes.Call, getMime));
+        h.Append(h.Create(OpCodes.Call, ignoreCase));
+        h.Append(h.Create(OpCodes.Newobj, dictCtor));
+        h.Append(h.Create(OpCodes.Callvirt, getResult));
+        h.Append(h.Create(OpCodes.Call, fromResultObj));
+        h.Append(h.Create(OpCodes.Ret));
+        service.Methods.Add(helper);
+
+        // Get(GetLiveSubtitlePlaylist) => EmbyNoShare_LiveSubtitles(this, request), siempre
+        stub.Body.SimplifyMacros();
+        var sp = stub.Body.GetILProcessor();
+        var first = stub.Body.Instructions[0];
+        foreach (var ins in new[] { sp.Create(OpCodes.Ldarg_0), sp.Create(OpCodes.Ldarg_1), sp.Create(OpCodes.Call, helper), sp.Create(OpCodes.Ret) })
+            sp.InsertBefore(first, ins);
+        stub.Body.OptimizeMacros();
+
+        // GetSubtitleSegmentText(fileSystem, segmentPath, ...): segmentPath = LiveSubtitlesCode.SegmentPath(segmentPath)
+        segText.Body.SimplifyMacros();
+        var tp2 = segText.Body.GetILProcessor();
+        var first2 = segText.Body.Instructions[0];
+        foreach (var ins in new[] { tp2.Create(OpCodes.Ldarg, segText.Parameters[1]), tp2.Create(OpCodes.Call, code["SegmentPath"]), tp2.Create(OpCodes.Starg, segText.Parameters[1]) })
+            tp2.InsertBefore(first2, ins);
+        segText.Body.OptimizeMacros();
+    };
+}
 
 // AVPlayer (iPhone, Apple TV) desactiva la pista de subtítulos si las cabeceras de su lista cambian de una petición a
 // otra. La lista vacía de live-subtitles-nowait no llevaba #EXT-X-PLAYLIST-TYPE:EVENT y su TARGETDURATION (3) no era el

@@ -4,3 +4,4 @@ src/bin/
 src/obj/
 *.dll
 *.deb
+helpers/out/

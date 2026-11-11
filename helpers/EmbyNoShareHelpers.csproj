@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Código que el parcheador copia dentro de las DLL de Emby. Solo puede usar la biblioteca estándar de .NET,
+       sin lambdas, async, LINQ, campos estáticos ni tipos propios: se copia método a método. -->
+  <PropertyGroup>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <Optimize>true</Optimize>
+    <DebugType>none</DebugType>
+    <AssemblyName>EmbyNoShareHelpers</AssemblyName>
+  </PropertyGroup>
+</Project>
