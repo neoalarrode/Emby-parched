@@ -58,7 +58,7 @@ done
 if command -v docker >/dev/null 2>&1; then
   echo
   echo "=== Dispatcharr (plugin, últimas 24 h)"
-  docker logs --since 24h dispatcharr 2>&1 | grep -iE 'intro_relay|irelay|ghost|No clients remain|410|subt' | sed -E 's/([?&](u|p|api_key|token)=)[^&" ]*/\1XXX/g' | cut -c1-220 | tail -60
+  docker logs --since 24h dispatcharr 2>&1 | grep -iE 'intro_relay|irelay|ghost|No clients remain|410|subt' | sed -E 's/([?&](u|p|api_key|token)=)[^&" ]*/\1XXX/g; s#/u=[^/]*/p=[^/ "]*#/u=XXX/p=XXX#g' | cut -c1-220 | tail -60
 fi
 } > "$OUT" 2>&1
 echo "Hecho: $OUT ($(wc -l < "$OUT") líneas). Pégamelo o adjúntalo."
