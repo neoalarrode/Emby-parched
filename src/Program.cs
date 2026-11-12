@@ -72,6 +72,9 @@
 //   live-reconnect-factor (Emby.LiveTV.dll, EmbyNoShare.LiveReconnectFactor):
 //     LimitingRetryHandler.Add multiplica el máximo de reconexiones por EMBY_LIVE_RECONNECT_FACTOR (por
 //     defecto 5). Emby solo permitía 2 reconexiones en 5 min, 4 en 30 min y 6 en 1 h antes de cerrar el canal.
+//   live-heartbeat (Emby.LiveTV.dll, EmbyNoShare.LiveHeartbeat):
+//     Cada canal que lee la salida HLS de Dispatcharr le manda un latido cada 0,5 s y una despedida al cerrarse
+//     (…/index.m3u8?irelay=latido|adios), para que Dispatcharr (plugin Intro Relay) cierre la sesión al momento.
 // Emby.Server.MediaEncoding.dll
 //   live-hls-window (marcador EmbyNoShare.LiveHlsWindow):
 //     BaseHlsService.GetLivePlaylistText (HLS convertido con ffmpeg) era una playlist EVENT que nunca borraba
@@ -137,6 +140,7 @@ var patches = new (string Assembly, string Marker, string Name, Func<ModuleDefin
     ("Emby.LiveTV", "LiveReconnectFactor", "live-reconnect-factor", PrepareLiveReconnectFactor),
     ("Emby.Server.MediaEncoding", "LiveHlsWindow", "live-hls-window", PrepareLiveHlsWindow),
     ("Emby.LiveTV", "LiveFastOpen", "live-fast-open", PrepareLiveFastOpen),
+    ("Emby.LiveTV", "LiveHeartbeat", "live-heartbeat", PrepareLiveHeartbeat),
     ("Emby.Server.MediaEncoding", "LiveSubtitlesAll", "live-subtitles-all", PrepareLiveSubtitlesAll),
     ("Emby.Server.MediaEncoding", "LiveSubtitlesJob", "live-subtitles-job", PrepareLiveSubtitlesJob),
     ("Emby.Server.MediaEncoding", "SubtitlesOcrKeepCodec", "subtitles-ocr-keep-codec", PrepareSubtitlesOcrKeepCodec),
@@ -2040,6 +2044,43 @@ static Action? PrepareDvbSubtitleLanguage(ModuleDefinition module)
 // y sin reconocer formato (recognize=none). Medido con 30 min de La 1: el preprocesado perdía frases enteras y metía
 // casi todo el error (CER 0,74 % -> 0,06 %, 3 frases perdidas -> 0), y el reconocimiento de formato solo añadía
 // etiquetas <b>/<font> a trozos (712 líneas -> 0) sin cambiar el texto. Vale para todas las cadenas.
+// Latido hacia Dispatcharr. Dispatcharr da por perdido a un cliente HLS a los 12 s sin peticiones (3 segmentos de 4 s),
+// y no puede bajarlo: el ffmpeg de Emby pide la lista cada 4-5 s. Así que cada canal en directo de Emby que lee la salida
+// HLS de Dispatcharr le manda un latido cada medio segundo (…/index.m3u8?irelay=latido) y, al cerrarse, una despedida
+// (?irelay=adios). El plugin Intro Relay de Dispatcharr cierra la sesión al recibir la despedida, o a los 2 s sin
+// latidos (Emby caído). Sin el plugin, Dispatcharr contesta a esas peticiones como a cualquier otra lista.
+// Se engancha al final del constructor de LiveStream: un hilo por canal, que espera a que se abra y termina al cerrarse.
+static Action? PrepareLiveHeartbeat(ModuleDefinition module)
+{
+    var ls = module.GetType("Emby.LiveTV.TunerHosts.LiveStream") ?? throw new Exception("No se encuentra LiveStream");
+    var ctors = ls.Methods.Where(m => m.IsConstructor && !m.IsStatic).ToList();
+    if (ctors.Count != 1) throw new Exception($"Se esperaba 1 constructor de LiveStream, hay {ctors.Count}");
+    if (!ls.Fields.Any(f => f.Name == "LiveStreamCancellationTokenSource" && f.FieldType.FullName == "System.Threading.CancellationTokenSource"))
+        throw new Exception("No se encuentra LiveStream.LiveStreamCancellationTokenSource");
+    if (!ls.Properties.Any(p => p.Name == "MediaSource"))
+        throw new Exception("No se encuentra LiveStream.MediaSource");
+    var ctor = ctors[0];
+    Console.WriteLine($"[live-heartbeat] {ctor.FullName}");
+    return () =>
+    {
+        var code = CopyHelpers(module, "EmbyNoShare.LatidoCode", "LatidoCode");
+        var il = ctor.Body.GetILProcessor();
+        foreach (var ret in ctor.Body.Instructions.Where(i => i.OpCode == OpCodes.Ret).ToList())
+        {
+            var first = il.Create(OpCodes.Ldarg_0);
+            il.InsertBefore(ret, first);
+            il.InsertBefore(ret, il.Create(OpCodes.Call, code["Start"]));
+            foreach (var i in ctor.Body.Instructions)
+                if (i.Operand == ret && i != first) i.Operand = first;
+            foreach (var eh in ctor.Body.ExceptionHandlers)
+            {
+                if (eh.HandlerEnd == ret) eh.HandlerEnd = first;
+                if (eh.TryEnd == ret) eh.TryEnd = first;
+            }
+        }
+    };
+}
+
 static Action? PrepareOcrCleanInput(ModuleDefinition module)
 {
     var builder = module.GetType("Emby.Server.MediaEncoding.Encoder.Pipelines.Subtitles.SubtitlePipelineBuilderDefault")
