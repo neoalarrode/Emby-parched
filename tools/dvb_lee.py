@@ -12,6 +12,7 @@ ap.add_argument("--canal", help="UUID del canal en Dispatcharr")
 ap.add_argument("--fichero", help="en vez de un canal, un .ts grabado")
 ap.add_argument("--dispatcharr", default="http://127.0.0.1:9191")
 ap.add_argument("--minutos", type=float, default=3)
+ap.add_argument("--desconocidas", help="fichero JSON donde guardar la forma de cada letra desconocida con su frase")
 a = ap.parse_args()
 sys.path.insert(0, a.irelay)
 from irelay import dvbsub, glyphs  # noqa: E402
@@ -20,9 +21,23 @@ exact, shapes = glyphs.table()
 print(f"tabla: {len(shapes)} formas de letra", flush=True)
 
 
+UNKNOWN = []          # [ancho, alto, hex, frase] de cada letra desconocida (formato de letras.json)
+
+
+def pack(bits):
+    w, h = len(bits[0]), len(bits)
+    by = bytearray((w * h + 7) // 8)
+    for y in range(h):
+        for x in range(w):
+            if bits[y][x]:
+                by[(y * w + x) >> 3] |= 0x80 >> ((y * w + x) & 7)
+    return w, h, by.hex()
+
+
 def text_of(pixels, luma):
     """Texto con '?' en las letras desconocidas, y (letras reconocidas, total)."""
     lines, known, total = [], 0, 0
+    unknown_here = []
     for line in glyphs.segment(pixels, luma):
         out, prev = "", None
         for bits, x, _y in line:
@@ -32,10 +47,15 @@ def text_of(pixels, luma):
             if prev is not None and x - prev >= glyphs.SPACE:
                 out += " "
             out += ch if ch is not None else "?"
+            if ch is None:
+                unknown_here.append(pack(bits))
             prev = x + len(bits[0])
         if out:
             lines.append(out)
-    return " / ".join(lines), known, total
+    text = " / ".join(lines)
+    for w, h, hx in unknown_here:
+        UNKNOWN.append([w, h, hx, text])
+    return text, known, total
 
 
 if a.fichero:
@@ -127,3 +147,8 @@ s = stats
 print(f"\nsubtítulos: {s['subs']} | leídos enteros con la tabla: {s['enteros']} "
       f"({100 * s['enteros'] / max(1, s['subs']):.0f} %) | letras reconocidas: {s['conocidas']} de {s['letras']} "
       f"({100 * s['conocidas'] / max(1, s['letras']):.1f} %) | conjuntos que no se pudieron leer: {s['errores']}")
+
+if a.desconocidas:
+    import json
+    json.dump(UNKNOWN, open(a.desconocidas, "w"), ensure_ascii=False)
+    print(f"{len(UNKNOWN)} letras desconocidas guardadas en {a.desconocidas}")
