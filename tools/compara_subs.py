@@ -201,6 +201,7 @@ def main():
     ap.add_argument("--emby-clave-fichero", default="/root/emby-trabajo/.emby_api_key")
     ap.add_argument("--emby-canal")
     ap.add_argument("--idioma", default="spa")
+    ap.add_argument("--emby-codec", help="en Emby, usar el subtítulo con este códec (p. ej. webvtt o dvbsub)")
     ap.add_argument("--minutos", type=float, default=5)
     ap.add_argument("--dvb-canal", help="UUID de Dispatcharr de un canal con subtítulos DVB (UDP): compara con el OCR de Emby")
     a = ap.parse_args()
@@ -265,8 +266,9 @@ def main():
             pi = json.loads(urllib.request.urlopen(req, timeout=120).read())
             ms = pi["MediaSources"][0]
             st = [s for s in ms["MediaStreams"] if s["Type"] == "Subtitle"]
-            print(f"[emby] subtítulos del canal: {[(s['Index'], s.get('Codec'), s.get('Language')) for s in st]}")
-            sub = next((s for s in st if s.get("Language") == a.idioma), st[0] if st else None)
+            print(f"[emby] subtítulos del canal: {[(s['Index'], s.get('Codec'), s.get('Language')) for s in st]}", flush=True)
+            cand = [s for s in st if not a.emby_codec or (s.get("Codec") or "").lower() == a.emby_codec.lower()]
+            sub = next((s for s in cand if s.get("Language") == a.idioma), cand[0] if cand else None)
             if sub is None:
                 print("[emby] el canal no tiene subtítulos")
             else:
