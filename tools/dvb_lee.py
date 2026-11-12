@@ -12,6 +12,8 @@ ap.add_argument("--canal", help="UUID del canal en Dispatcharr")
 ap.add_argument("--fichero", help="en vez de un canal, un .ts grabado")
 ap.add_argument("--dispatcharr", default="http://127.0.0.1:9191")
 ap.add_argument("--minutos", type=float, default=3)
+ap.add_argument("--recoger", help="fichero .json.gz donde guardar cada línea distinta (formas de letra y posiciones) "
+                                    "para hacer la tabla de una cadena")
 ap.add_argument("--desconocidas", help="fichero JSON donde guardar la forma de cada letra desconocida con su frase")
 a = ap.parse_args()
 sys.path.insert(0, a.irelay)
@@ -22,6 +24,7 @@ print(f"tabla: {len(shapes)} formas de letra", flush=True)
 
 
 UNKNOWN = []          # [ancho, alto, hex, frase] de cada letra desconocida (formato de letras.json)
+SHAPES, SHAPE_ID, LINES = [], {}, {}   # formas distintas, forma -> índice, línea (índices y x) -> veces vista
 
 
 def pack(bits):
@@ -39,6 +42,16 @@ def text_of(pixels, luma):
     lines, known, total = [], 0, 0
     unknown_here = []
     for line in glyphs.segment(pixels, luma):
+        if a.recoger and line:
+            ids = []
+            for bits, x, y in line:
+                w, h, hx = pack(bits)
+                key = (w, h, hx)
+                if key not in SHAPE_ID:
+                    SHAPE_ID[key] = len(SHAPES)
+                    SHAPES.append([w, h, hx])
+                ids.append((SHAPE_ID[key], x - line[0][1], y))
+            LINES[tuple(ids)] = LINES.get(tuple(ids), 0) + 1
         out, prev = "", None
         for bits, x, _y in line:
             ch = glyphs.char(bits)
@@ -152,3 +165,9 @@ if a.desconocidas:
     import json
     json.dump(UNKNOWN, open(a.desconocidas, "w"), ensure_ascii=False)
     print(f"{len(UNKNOWN)} letras desconocidas guardadas en {a.desconocidas}")
+
+if a.recoger:
+    import gzip, json
+    with gzip.open(a.recoger, "wt", encoding="utf-8") as f:
+        json.dump({"g": SHAPES, "l": [[list(map(list, k)), n] for k, n in LINES.items()]}, f)
+    print(f"recogidas {len(LINES)} líneas distintas con {len(SHAPES)} formas de letra en {a.recoger}")
