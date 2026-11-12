@@ -143,6 +143,7 @@ var patches = new (string Assembly, string Marker, string Name, Func<ModuleDefin
     ("Emby.Server.MediaEncoding", "LiveSubtitlesNoWait", "live-subtitles-nowait", PrepareLiveSubtitlesNoWait),
     ("Emby.Server.MediaEncoding", "LiveSubtitlesHeaders", "live-subtitles-headers", PrepareLiveSubtitlesHeaders),
     ("Emby.Server.MediaEncoding", "LiveSubtitlesList", "live-subtitles-list", PrepareLiveSubtitlesList),
+    ("Emby.Server.MediaEncoding", "OcrCleanInput", "ocr-clean-input", PrepareOcrCleanInput),
     ("Emby.Server.MediaEncoding", "DvbSubtitleLanguage", "dvb-subtitle-language", PrepareDvbSubtitleLanguage),
 };
 
@@ -2034,6 +2035,92 @@ static Action? PrepareDvbSubtitleLanguage(ModuleDefinition module)
     };
 }
 
+
+// OCR de subtítulos gráficos (filtro graphicsub2text): sin el preprocesado de Emby («reduce colors, remove outlines»)
+// y sin reconocer formato (recognize=none). Medido con 30 min de La 1: el preprocesado perdía frases enteras y metía
+// casi todo el error (CER 0,74 % -> 0,06 %, 3 frases perdidas -> 0), y el reconocimiento de formato solo añadía
+// etiquetas <b>/<font> a trozos (712 líneas -> 0) sin cambiar el texto. Vale para todas las cadenas.
+static Action? PrepareOcrCleanInput(ModuleDefinition module)
+{
+    var builder = module.GetType("Emby.Server.MediaEncoding.Encoder.Pipelines.Subtitles.SubtitlePipelineBuilderDefault")
+        ?? throw new Exception("No se encuentra SubtitlePipelineBuilderDefault");
+    MethodDefinition? method = null;
+    Instruction? ctor = null;
+    foreach (var m in builder.Methods.Where(m => m.HasBody))
+    {
+        var c = m.Body.Instructions.FirstOrDefault(i => i.OpCode == OpCodes.Newobj && i.Operand is MethodReference r
+                                                        && r.DeclaringType.Name == "graphicsub2text");
+        if (c != null) { method = m; ctor = c; break; }
+    }
+    if (method == null || ctor == null) throw new Exception("No se encuentra new graphicsub2text()");
+    var il = method.Body.Instructions;
+    var filterType = ((MethodReference)ctor.Operand).DeclaringType;
+    var store = ctor.Next;
+    var vVal = StoredLocal(method, store) ?? throw new Exception("Patrón inesperado al guardar graphicsub2text");
+    var delay = il.SingleOrDefault(i => i.Operand is MethodReference r && r.Name == "set_delay_when_no_duration")
+        ?? throw new Exception("No se encuentra set_delay_when_no_duration");
+    // Flags["recognize"] = "none": la secuencia que ya usa Emby (ldloc val ... ldstr "recognize"; ldstr "none"; callvirt set_Item)
+    var none = il.SingleOrDefault(i => i.OpCode == OpCodes.Ldstr && (string)i.Operand == "none") ?? throw new Exception("No se encuentra \"none\"");
+    var setItem = none.Next;
+    if (setItem.Operand is not MethodReference si || si.Name != "set_Item") throw new Exception("Patrón inesperado tras \"none\"");
+    var seq = new List<Instruction>();
+    for (var i = none.Previous; i != null; i = i.Previous)
+    {
+        seq.Insert(0, i);
+        if (LoadedLocal(method, i) == vVal)
+            break;
+        if (seq.Count > 8) throw new Exception("Patrón inesperado antes de \"none\"");
+    }
+    var boolScope = ScopeOf(module, "System.Nullable`1");
+    Console.WriteLine($"[ocr-clean-input] {method.FullName}");
+    return () =>
+    {
+        var ts = module.TypeSystem;
+        var nullable = new TypeReference("System", "Nullable`1", module, boolScope, valueType: true);
+        nullable.GenericParameters.Add(new GenericParameter("T", nullable));
+        var nullableBool = new GenericInstanceType(nullable);
+        nullableBool.GenericArguments.Add(ts.Boolean);
+        var nctor = new MethodReference(".ctor", ts.Void, nullableBool) { HasThis = true };
+        nctor.Parameters.Add(new ParameterDefinition(nullable.GenericParameters[0]));
+        var setPre = new MethodReference("set_preprocess_images", ts.Void, filterType) { HasThis = true };
+        setPre.Parameters.Add(new ParameterDefinition(nullableBool));
+        var p = method.Body.GetILProcessor();
+        var anchor = delay;
+        void Add(Instruction ins) { p.InsertAfter(anchor, ins); anchor = ins; }
+        // val.preprocess_images = false
+        Add(p.Create(OpCodes.Ldloc, vVal));
+        Add(p.Create(OpCodes.Ldc_I4_0));
+        Add(p.Create(OpCodes.Newobj, nctor));
+        Add(p.Create(OpCodes.Callvirt, setPre));
+        // val.Options.Flags["recognize"] = "none"
+        foreach (var i in seq)
+            Add(i.Operand is VariableDefinition v ? p.Create(OpCodes.Ldloc, v) : CloneIns(p, i));
+        Add(p.Create(OpCodes.Ldstr, "none"));
+        Add(p.Create(setItem.OpCode, (MethodReference)setItem.Operand));
+    };
+}
+
+static Instruction CloneIns(ILProcessor p, Instruction i) => i.Operand switch
+{
+    null => p.Create(i.OpCode),
+    MethodReference m => p.Create(i.OpCode, m),
+    FieldReference f => p.Create(i.OpCode, f),
+    TypeReference t => p.Create(i.OpCode, t),
+    string s => p.Create(i.OpCode, s),
+    VariableDefinition v => p.Create(i.OpCode, v),
+    ParameterDefinition a => p.Create(i.OpCode, a),
+    _ => throw new Exception("Instrucción que no sé copiar: " + i),
+};
+
+static VariableDefinition? LoadedLocal(MethodDefinition method, Instruction ins) => ins.OpCode.Code switch
+{
+    Code.Ldloc_0 => method.Body.Variables[0],
+    Code.Ldloc_1 => method.Body.Variables[1],
+    Code.Ldloc_2 => method.Body.Variables[2],
+    Code.Ldloc_3 => method.Body.Variables[3],
+    Code.Ldloc or Code.Ldloc_S => ins.Operand as VariableDefinition,
+    _ => null,
+};
 
 // Copia en `module` los métodos estáticos de un tipo de EmbyNoShareHelpers.dll (recurso incrustado; código que solo usa
 // la biblioteca estándar) como un tipo nuevo `EmbyNoShare.<name>`. Devuelve los métodos copiados por nombre.
