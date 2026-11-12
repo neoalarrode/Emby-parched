@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Net.Http;
 using System.Reflection;
 using System.Threading;
@@ -84,6 +85,50 @@ namespace EmbyNoShare
             }
         }
 
+        /// <summary>La sesión de Dispatcharr de la URL (lo que va tras /proxy/hls/ hasta la barra siguiente).</summary>
+        static string Token(string url)
+        {
+            int i = url.IndexOf("/proxy/hls/", StringComparison.OrdinalIgnoreCase);
+            if (i < 0)
+                return null;
+            i += 11;
+            int j = url.IndexOf('/', i);
+            string token = j > i ? url.Substring(i, j - i) : url.Substring(i);
+            return token.Length >= 8 ? token : null;
+        }
+
+        /// <summary>1 si algún proceso (el ffmpeg o ffprobe de Emby) tiene esa sesión en su línea de órdenes, 0 si
+        /// ninguno, -1 si no se puede saber (sin /proc).</summary>
+        static int Holder(string token)
+        {
+            try
+            {
+                if (token == null || !Directory.Exists("/proc"))
+                    return -1;
+                string[] dirs = Directory.GetDirectories("/proc");
+                for (int k = 0; k < dirs.Length; k++)
+                {
+                    string name = Path.GetFileName(dirs[k]);
+                    if (name.Length == 0 || name[0] < '0' || name[0] > '9')
+                        continue;
+                    try
+                    {
+                        string cmd = File.ReadAllText(dirs[k] + "/cmdline");
+                        if (cmd.IndexOf(token, StringComparison.Ordinal) >= 0)
+                            return 1;
+                    }
+                    catch (Exception)
+                    {
+                    }
+                }
+                return 0;
+            }
+            catch (Exception)
+            {
+                return -1;
+            }
+        }
+
         public static void Loop(object live)
         {
             HttpClient client = null;
@@ -93,6 +138,7 @@ namespace EmbyNoShare
                 client.Timeout = TimeSpan.FromSeconds(2);
                 string last = null;
                 int idle = 0;
+                bool seen = false;                       // ya hubo un proceso de Emby leyendo esta sesión
                 while (true)
                 {
                     int state = State(live);
@@ -107,9 +153,18 @@ namespace EmbyNoShare
                     {
                         last = url;
                         idle = 0;
-                        int code = Send(client, url, "latido");
-                        if (code == 404 || code == 410)
-                            return;                     // la sesión ya no existe en Dispatcharr
+                        // El latido va mientras el ffmpeg de Emby lee la sesión (o mientras aún no ha arrancado). Si
+                        // la conversión se para, Emby no cierra el canal (sigue abierto un rato); sin latido,
+                        // Dispatcharr lo cierra a los 2 s. Si vuelve un ffmpeg con la misma sesión, el latido sigue.
+                        int holder = Holder(Token(url));
+                        if (holder == 1)
+                            seen = true;
+                        if (holder != 0 || !seen)
+                        {
+                            int code = Send(client, url, "latido");
+                            if (code == 404 || code == 410)
+                                return;                 // la sesión ya no existe en Dispatcharr
+                        }
                     }
                     else if (++idle > 1200)
                     {
