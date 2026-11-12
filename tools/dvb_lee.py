@@ -14,6 +14,8 @@ ap.add_argument("--dispatcharr", default="http://127.0.0.1:9191")
 ap.add_argument("--minutos", type=float, default=3)
 ap.add_argument("--recoger", help="fichero .json.gz donde guardar cada línea distinta (formas de letra y posiciones) "
                                     "para hacer la tabla de una cadena")
+ap.add_argument("--dudosas", type=float, default=0.12,
+                help="con --desconocidas, guarda también las letras leídas por aproximación con esta diferencia o más")
 ap.add_argument("--desconocidas", help="fichero JSON donde guardar la forma de cada letra desconocida con su frase")
 a = ap.parse_args()
 sys.path.insert(0, a.irelay)
@@ -55,19 +57,23 @@ def text_of(pixels, luma):
         out, prev = "", None
         for bits, x, _y in line:
             ch = glyphs.char(bits)
+            if ch is not None and a.desconocidas and bits not in exact:
+                d = min(glyphs._distance(bits, sh) for sh, c in shapes if c == ch)
+                if d >= a.dudosas:
+                    unknown_here.append(pack(bits) + (f"{ch}~{d:.2f}",))
             total += 1
             known += ch is not None
             if prev is not None and x - prev >= glyphs.SPACE:
                 out += " "
             out += ch if ch is not None else "?"
             if ch is None:
-                unknown_here.append(pack(bits))
+                unknown_here.append(pack(bits) + ("?",))
             prev = x + len(bits[0])
         if out:
             lines.append(out)
     text = " / ".join(lines)
-    for w, h, hx in unknown_here:
-        UNKNOWN.append([w, h, hx, text])
+    for w, h, hx, guess in unknown_here:
+        UNKNOWN.append([w, h, hx, text, guess])
     return text, known, total
 
 
