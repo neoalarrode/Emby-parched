@@ -36,25 +36,24 @@ for block in vtt.split("\n\n"):
             break
 if not ref or not ocr:
     sys.exit(f"sin datos: referencia {len(ref)}, ocr {len(ocr)}")
-# desfase: el que más frases empareja a menos de 0,3 s
-best = (0, 0.0)
-for r0, _d, _t in ref[:30]:
-    for o0, _t2 in ocr[:30]:
-        off = o0 - r0
-        hits = sum(1 for x, _d, _t in ref if any(abs(x + off - y) < 0.3 for y, _ in ocr))
-        if hits > best[0]:
-            best = (hits, off)
-off = best[1]
+# Emparejamiento por texto, en orden (sin tiempos: el ffmpeg suelto, sin vídeo, no da bien las duraciones): para cada
+# frase de la referencia, la más parecida entre las siguientes del OCR
+off = 0.0
 missing = exact = 0
 errs = chars = 0
 worst = []
+j = 0
 for r0, _d, rt in ref:
-    m = min(ocr, key=lambda o: abs(o[0] - r0 - off))
-    if abs(m[0] - r0 - off) > 0.3:
+    cand = [(difflib.SequenceMatcher(None, rt, ocr[k][1], autojunk=False).ratio(), k) for k in range(j, min(len(ocr), j + 6))]
+    best_ratio, k = max(cand) if cand else (0, None)
+    if k is None or best_ratio < 0.5:
         missing += 1
         errs += len(rt)
         chars += len(rt)
+        worst.append((len(rt), rt, "(no está)"))
         continue
+    j = k + 1
+    m = ocr[k]
     sm = difflib.SequenceMatcher(None, rt, m[1], autojunk=False)
     e = sum(max(i2 - i1, j2 - j1) for tag, i1, i2, j1, j2 in sm.get_opcodes() if tag != "equal")
     errs += e
