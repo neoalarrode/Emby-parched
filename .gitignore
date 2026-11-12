@@ -5,3 +5,4 @@ src/obj/
 *.dll
 *.deb
 helpers/out/
+__pycache__/
