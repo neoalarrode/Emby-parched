@@ -142,8 +142,10 @@ var patches = new (string Assembly, string Marker, string Name, Func<ModuleDefin
     ("Emby.LiveTV", "LiveFastOpen", "live-fast-open", PrepareLiveFastOpen),
     ("Emby.LiveTV", "LiveHeartbeat", "live-heartbeat", PrepareLiveHeartbeat),
     ("Emby.Server.MediaEncoding", "LiveSubtitlesAll", "live-subtitles-all", PrepareLiveSubtitlesAll),
+    ("Emby.MediaEncoding.Logic", "LiveSubtitlesAll", "live-subtitles-all", PrepareLiveSubtitlesAll),
     ("Emby.Server.MediaEncoding", "LiveSubtitlesJob", "live-subtitles-job", PrepareLiveSubtitlesJob),
     ("Emby.Server.MediaEncoding", "SubtitlesOcrKeepCodec", "subtitles-ocr-keep-codec", PrepareSubtitlesOcrKeepCodec),
+    ("Emby.MediaEncoding.Logic", "SubtitlesOcrKeepCodec", "subtitles-ocr-keep-codec", PrepareSubtitlesOcrKeepCodec),
     ("Emby.Server.MediaEncoding", "LiveSubtitlesNoWait", "live-subtitles-nowait", PrepareLiveSubtitlesNoWait),
     ("Emby.Server.MediaEncoding", "LiveSubtitlesHeaders", "live-subtitles-headers", PrepareLiveSubtitlesHeaders),
     ("Emby.Server.MediaEncoding", "LiveSubtitlesList", "live-subtitles-list", PrepareLiveSubtitlesList),
@@ -160,6 +162,7 @@ if (applicable.Count == 0)
 
 // Localiza y valida todos los parches pendientes antes de tocar nada
 var pending = new List<(string Marker, string Name, Action Apply)>();
+var failed = new List<string>();
 foreach (var (_, marker, name, prepare) in applicable)
 {
     if (module.Types.Any(t => t.FullName == "EmbyNoShare." + marker))
@@ -167,13 +170,29 @@ foreach (var (_, marker, name, prepare) in applicable)
         Console.WriteLine($"[{name}] ya aplicado");
         continue;
     }
-    var apply = prepare(module);
+    Action? apply;
+    try
+    {
+        apply = prepare(module);
+    }
+    catch (Exception e) when (checkOnly)
+    {
+        Console.WriteLine($"[{name}] FALLA: {e.Message}");
+        failed.Add(name);
+        continue;
+    }
     if (apply == null)
     {
         Console.WriteLine($"[{name}] no necesario en esta versión de Emby");
         continue;
     }
     pending.Add((marker, name, apply));
+}
+
+if (failed.Count > 0)
+{
+    Console.WriteLine("Comprobación FALLIDA. No encajan: " + string.Join(", ", failed) + ". Encajan: " + string.Join(", ", pending.Select(x => x.Name)));
+    return 1;
 }
 
 if (pending.Count == 0)
@@ -203,8 +222,46 @@ return 0;
 static MethodDefinition GetMoveNext(TypeDefinition type, string asyncMethod)
 {
     var sm = type.NestedTypes.Where(t => t.Name.StartsWith("<" + asyncMethod + ">")).ToList();
+    if (sm.Count == 0)
+    {
+        // Emby 4.11.0.19 y posteriores ofuscan los nombres privados: el método async (ahora sin nombre legible) se
+        // reconoce porque su primer parámetro es la petición del mismo nombre (OpenMediaSource(OpenMediaSource ...))
+        var stubs = type.Methods.Where(m => m.HasBody && !IsReadable(m.Name) && m.Parameters.Count > 0
+            && m.Parameters[0].ParameterType.Name == asyncMethod).ToList();
+        sm = stubs.Select(StateMachineOf).Where(t => t != null).Select(t => t!).Distinct().ToList();
+    }
     if (sm.Count != 1) throw new Exception($"Se esperaba 1 state machine {asyncMethod}, hay {sm.Count}");
-    return sm[0].Methods.Single(m => m.Name == "MoveNext");
+    return MoveNextOf(sm[0]);
+}
+
+static T? OneOrNull<T>(IEnumerable<T> items) where T : class
+{
+    var list = items.Take(2).ToList();
+    return list.Count == 1 ? list[0] : null;
+}
+
+static bool IsReadable(string name) => name.All(c => c > 32 && c < 127);
+
+/// La state machine de un método async: la del atributo AsyncStateMachine o, si se ha quitado, la variable local del
+/// método que implementa IAsyncStateMachine
+static TypeDefinition? StateMachineOf(MethodDefinition stub)
+{
+    var attr = stub.CustomAttributes.FirstOrDefault(a => a.AttributeType.Name == "AsyncStateMachineAttribute");
+    if (attr != null && attr.ConstructorArguments.Count == 1 && attr.ConstructorArguments[0].Value is TypeReference tr)
+        return tr.Resolve();
+    if (!stub.HasBody) return null;
+    return stub.Body.Variables.Select(v => v.VariableType.Resolve()).FirstOrDefault(t => t != null
+        && t.DeclaringType == stub.DeclaringType && t.Interfaces.Any(i => i.InterfaceType.Name == "IAsyncStateMachine"));
+}
+
+/// MoveNext de una state machine (con nombres ofuscados: el método que implementa IAsyncStateMachine.MoveNext)
+static MethodDefinition MoveNextOf(TypeDefinition sm)
+{
+    var byName = sm.Methods.SingleOrDefault(m => m.Name == "MoveNext");
+    if (byName != null) return byName;
+    var impl = sm.Methods.SingleOrDefault(m => m.Overrides.Any(o => o.Name == "MoveNext"))
+        ?? throw new Exception("No se encuentra MoveNext en " + sm.FullName);
+    return impl;
 }
 
 static Action? PrepareNoShare(ModuleDefinition module)
@@ -325,10 +382,24 @@ static Action? PrepareHlsTargetDuration(ModuleDefinition module)
     };
 }
 
+/// El método que escribe live.m3u8 de las conversiones HLS: GetLivePlaylistText, o en Emby 4.11.0.19 y posteriores
+/// (nombres ofuscados) el método de instancia (StreamState, TranscodingJob, string, int) -> string que escribe "#EXTM3U"
+static MethodDefinition FindLivePlaylistText(TypeDefinition service)
+{
+    var byName = service.Methods.SingleOrDefault(m => m.Name == "GetLivePlaylistText");
+    if (byName != null) return byName;
+    var found = service.Methods.Where(m => !m.IsStatic && m.HasBody && m.ReturnType.FullName == "System.String" && m.Parameters.Count == 4
+        && m.Parameters[0].ParameterType.Name == "StreamState" && m.Parameters[1].ParameterType.Name == "TranscodingJob"
+        && m.Parameters[2].ParameterType.FullName == "System.String" && m.Parameters[3].ParameterType.FullName == "System.Int32"
+        && m.Body.Instructions.Any(i => i.OpCode == OpCodes.Ldstr && (string)i.Operand == "#EXTM3U")).ToList();
+    if (found.Count != 1) throw new Exception($"No se encuentra GetLivePlaylistText ({found.Count} candidatos)");
+    return found[0];
+}
+
 static Action? PrepareHlsHoldBack(ModuleDefinition module)
 {
     var service = module.GetType("Emby.Server.MediaEncoding.Api.Hls.BaseHlsService") ?? throw new Exception("No se encuentra BaseHlsService");
-    var method = service.Methods.SingleOrDefault(m => m.Name == "GetLivePlaylistText") ?? throw new Exception("No se encuentra GetLivePlaylistText");
+    var method = FindLivePlaylistText(service);
     if (method.IsStatic || method.Parameters.Count < 1 || method.Parameters[0].ParameterType.Name != "StreamState")
         throw new Exception("Firma inesperada de GetLivePlaylistText");
 
@@ -347,7 +418,9 @@ static Action? PrepareHlsHoldBack(ModuleDefinition module)
     // StreamState hereda EncodingJobInfo.UserAgent (rellenado con el User-Agent de la petición)
     MethodReference? getUserAgent = null;
     // Solo se recorren clases del propio ensamblado (así no hace falta resolver System.Runtime)
-    for (var t = method.Parameters[0].ParameterType.Resolve(); t != null && getUserAgent == null; t = t.BaseType != null && t.BaseType.Scope == module ? t.BaseType.Resolve() : null)
+    // (en Emby 4.11.0.19 EncodingJobInfo está en Emby.MediaEncoding.Model.dll: se resuelve también fuera, hasta System.*)
+    for (var t = method.Parameters[0].ParameterType.Resolve(); t != null && getUserAgent == null;
+         t = t.BaseType != null && !t.BaseType.FullName.StartsWith("System.") ? TryResolve(t.BaseType) : null)
         getUserAgent = t.Properties.FirstOrDefault(pr => pr.Name == "UserAgent" && pr.GetMethod != null)?.GetMethod;
     if (getUserAgent == null) throw new Exception("No se encuentra StreamState.UserAgent");
     getUserAgent = module.ImportReference(getUserAgent);
@@ -587,6 +660,11 @@ static MethodReference Bcl(ModuleDefinition module, IMetadataScope scope, string
     return m;
 }
 
+static TypeDefinition? TryResolve(TypeReference t)
+{
+    try { return t.Resolve(); } catch (Exception) { return null; }
+}
+
 static IMetadataScope ScopeOf(ModuleDefinition module, string typeFullName)
 {
     return module.GetTypeReferences().FirstOrDefault(t => t.FullName == typeFullName)?.Scope
@@ -596,11 +674,18 @@ static IMetadataScope ScopeOf(ModuleDefinition module, string typeFullName)
 static Action? PrepareLangAliases(ModuleDefinition module)
 {
     var lm = module.GetType("Emby.Server.Implementations.Localization.LocalizationManager") ?? throw new Exception("No se encuentra LocalizationManager");
-    var method = lm.Methods.SingleOrDefault(m => m.Name == "FindLanguageInfosInternal" && m.Parameters.Count == 1) ?? throw new Exception("No se encuentra FindLanguageInfosInternal");
+    var method = lm.Methods.SingleOrDefault(m => m.Name == "FindLanguageInfosInternal" && m.Parameters.Count == 1)
+        // Emby 4.11.0.19 (nombres ofuscados): el único (string) -> CultureDto[] que busca en el diccionario
+        ?? OneOrNull(lm.Methods.Where(m => !IsReadable(m.Name) && m.HasBody && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.FullName == "System.String"
+            && m.ReturnType.IsArray && m.ReturnType.GetElementType().Name == "CultureDto"
+            && m.Body.Instructions.Any(i => i.Operand is MethodReference r && r.Name == "TryGetValue")))
+        ?? throw new Exception("No se encuentra FindLanguageInfosInternal");
     var il = method.Body.Instructions;
     // ldarg.0; ldfld _languageDictionary; ldarg.1; ldloca 0; callvirt TryGetValue; brfalse X; ldloc.0; ret; X: call Array.Empty<CultureDto>; ret
     var tryGet = il.SingleOrDefault(i => i.Operand is MethodReference m && m.Name == "TryGetValue") ?? throw new Exception("Patrón inesperado en FindLanguageInfosInternal");
-    var dictField = il.Select(i => i.Operand).OfType<FieldReference>().SingleOrDefault(f => f.Name == "_languageDictionary") ?? throw new Exception("No se encuentra _languageDictionary");
+    var dictField = il.Select(i => i.Operand).OfType<FieldReference>().SingleOrDefault(f => f.Name == "_languageDictionary")
+        ?? OneOrNull(il.Select(i => i.Operand).OfType<FieldReference>().Where(f => f.FieldType.Name.StartsWith("Dictionary`2") || f.FieldType.Name.StartsWith("ConcurrentDictionary`2")))
+        ?? throw new Exception("No se encuentra _languageDictionary");
     var empty = il.SingleOrDefault(i => i.Operand is MethodReference m && m.Name == "Empty" && m.DeclaringType.FullName == "System.Array") ?? throw new Exception("No se encuentra Array.Empty");
     if (empty.Next?.OpCode != OpCodes.Ret || method.Body.Variables.Count != 1) throw new Exception("Patrón inesperado en FindLanguageInfosInternal");
     var scope = ScopeOf(module, "System.String");
@@ -732,11 +817,22 @@ static Action? PrepareLangAliases(ModuleDefinition module)
     };
 }
 
+/// MediaSourceManager (en Emby 4.11.0.19 la clase tiene el nombre ofuscado: la que implementa IMediaSourceManager)
+static TypeDefinition FindMediaSourceManager(ModuleDefinition module)
+{
+    return module.GetType("Emby.Server.Implementations.Library.MediaSourceManager")
+        ?? OneOrNull(module.GetTypes().Where(t => t.IsClass && t.Interfaces.Any(i => i.InterfaceType.FullName == "MediaBrowser.Controller.Library.IMediaSourceManager")))
+        ?? throw new Exception("No se encuentra MediaSourceManager");
+}
+
 static Action? PrepareLiveAudioLanguageFirst(ModuleDefinition module)
 {
-    var msm = module.GetType("Emby.Server.Implementations.Library.MediaSourceManager") ?? throw new Exception("No se encuentra MediaSourceManager");
-    var method = msm.Methods.SingleOrDefault(m => m.Name == "SetDefaultAudioStreamIndex" && m.Parameters.Any(pr => pr.Name == "source")) ?? throw new Exception("No se encuentra SetDefaultAudioStreamIndex");
-    var source = method.Parameters.Single(pr => pr.Name == "source");
+    var msm = FindMediaSourceManager(module);
+    var method = msm.Methods.SingleOrDefault(m => m.Name == "SetDefaultAudioStreamIndex" && m.Parameters.Any(pr => pr.Name == "source"))
+        // Emby 4.11.0.19: el único que mira PlayDefaultAudioTrack
+        ?? OneOrNull(msm.Methods.Where(m => m.HasBody && !IsReadable(m.Name) && m.Body.Instructions.Any(i => i.Operand is MethodReference r && r.Name == "get_PlayDefaultAudioTrack")))
+        ?? throw new Exception("No se encuentra SetDefaultAudioStreamIndex");
+    var source = method.Parameters.SingleOrDefault(pr => pr.Name == "source") ?? method.Parameters.Single(pr => pr.ParameterType.Name == "MediaSourceInfo");
     if (source.ParameterType.FullName != "MediaBrowser.Model.Dto.MediaSourceInfo") throw new Exception("Tipo inesperado de source");
     var calls = method.Body.Instructions.Where(i => i.Operand is MethodReference m && m.Name == "get_PlayDefaultAudioTrack").ToList();
     if (calls.Count != 1) throw new Exception($"Se esperaba 1 get_PlayDefaultAudioTrack, hay {calls.Count}");
@@ -891,9 +987,12 @@ static Action? PrepareLiveOpenServerAudio(ModuleDefinition module)
     var get = gets[0];
     // Debe ser un argumento de SetDeviceSpecificData (sin otro uso entre medias)
     var next = get.Next;
-    while (next != null && !(next.Operand is MethodReference mr && (mr.Name == "SetDeviceSpecificData" || mr.Name.Contains("AwaitUnsafeOnCompleted"))))
+    // (en Emby 4.11.0.19 el nombre está ofuscado: método de MediaInfoService con la petición desglosada, 15+ parámetros)
+    bool IsSetDeviceData(MethodReference mr) => mr.Name == "SetDeviceSpecificData"
+        || (!IsReadable(mr.Name) && mr.DeclaringType.Name == "MediaInfoService" && mr.Parameters.Count >= 15);
+    while (next != null && !(next.Operand is MethodReference mr && (IsSetDeviceData(mr) || mr.Name.Contains("AwaitUnsafeOnCompleted"))))
         next = next.Next;
-    if (next == null || ((MethodReference)next.Operand).Name != "SetDeviceSpecificData") throw new Exception("AudioStreamIndex no va a SetDeviceSpecificData");
+    if (next == null || !IsSetDeviceData((MethodReference)next.Operand)) throw new Exception("AudioStreamIndex no va a SetDeviceSpecificData");
     Console.WriteLine($"[live-open-server-audio] {moveNext.FullName} (IL_{get.Offset:x4})");
 
     return () =>
@@ -921,10 +1020,23 @@ static Action? PrepareLiveOpenServerAudio(ModuleDefinition module)
 
 static Action? PrepareLiveOpenNoGlobalLock(ModuleDefinition module)
 {
-    var msm = module.GetType("Emby.Server.Implementations.Library.MediaSourceManager") ?? throw new Exception("No se encuentra MediaSourceManager");
-    var moveNext = GetMoveNext(msm, "OpenLiveStreamInternal2");
+    var msm = FindMediaSourceManager(module);
+    MethodDefinition moveNext;
+    if (msm.NestedTypes.Any(t => t.Name.StartsWith("<OpenLiveStreamInternal2>")))
+        moveNext = GetMoveNext(msm, "OpenLiveStreamInternal2");
+    else
+    {
+        // Emby 4.11.0.19: OpenLiveStreamInternal2(LiveStreamRequest, string, CancellationToken), con nombre ofuscado
+        var sm = msm.Methods.Where(m => !IsReadable(m.Name) && m.Parameters.Count == 3 && m.Parameters[0].ParameterType.Name == "LiveStreamRequest"
+            && m.Parameters[1].ParameterType.FullName == "System.String" && m.Parameters[2].ParameterType.Name == "CancellationToken")
+            .Select(StateMachineOf).Where(t => t != null).Distinct().ToList();
+        if (sm.Count != 1) throw new Exception($"Se esperaba 1 state machine OpenLiveStreamInternal2, hay {sm.Count}");
+        moveNext = MoveNextOf(sm[0]!);
+    }
     var il = moveNext.Body.Instructions;
-    bool IsSem(Instruction i) => i.Operand is FieldReference f && f.Name == "_liveStreamSemaphore";
+    var semField = msm.Fields.SingleOrDefault(f => f.Name == "_liveStreamSemaphore") ?? OneOrNull(msm.Fields.Where(f => f.FieldType.FullName == "System.Threading.SemaphoreSlim"))
+        ?? throw new Exception("No se encuentra _liveStreamSemaphore");
+    bool IsSem(Instruction i) => i.Operand is FieldReference f && f.Name == semField.Name && f.DeclaringType.FullName == msm.FullName;
     var waits = il.Where(i => i.Operand is MethodReference m && m.Name == "WaitAsync" && m.DeclaringType.FullName == "System.Threading.SemaphoreSlim").ToList();
     var releases = il.Where(i => i.Operand is MethodReference m && m.Name == "Release" && m.DeclaringType.FullName == "System.Threading.SemaphoreSlim").ToList();
     if (waits.Count != 1 || releases.Count != 1) throw new Exception($"Se esperaba 1 WaitAsync y 1 Release, hay {waits.Count} y {releases.Count}");
@@ -1200,13 +1312,64 @@ static Action? PrepareLiveReconnectFactor(ModuleDefinition module)
     };
 }
 
+// Emby 4.11.0.19 y posteriores: la lista sale de job.GetLivePlaylistSegments() (SegmentInfo[]) y MEDIA-SEQUENCE es el
+// índice del primero, así que basta con quedarse con los últimos: tras "arr = job?.GetLivePlaylistSegments() ??
+// Array.Empty()" se añade "arr = arr.TakeLast(LiveWindowCode.Keep(segmentLength)).ToArray()". Los ficheros los
+// borra el propio Emby (según el espacio libre).
+static Action? LiveHlsWindowSegments(ModuleDefinition module, MethodDefinition method)
+{
+    var il = method.Body.Instructions;
+    var empties = il.Where(i => i.Operand is GenericInstanceMethod g && g.Name == "Empty" && g.DeclaringType.FullName == "System.Array"
+        && g.GenericArguments[0].Name == "SegmentInfo").ToList();
+    if (empties.Count != 1) throw new Exception($"Patrón inesperado de la lista de segmentos ({empties.Count})");
+    var store = empties[0].Next;
+    var arr = StoredLocal(method, store) ?? throw new Exception("Patrón inesperado al guardar los segmentos: " + store);
+    var segType = ((GenericInstanceMethod)empties[0].Operand).GenericArguments[0];
+    var linqScope = module.GetMemberReferences().OfType<MethodReference>().FirstOrDefault(m => m.DeclaringType.FullName == "System.Linq.Enumerable")?.DeclaringType.Scope
+        ?? throw new Exception("No se encuentra System.Linq.Enumerable");
+    Console.WriteLine($"[live-hls-window] {method.FullName} (IL_{store.Offset:x4}, segmentos)");
+    return () =>
+    {
+        var ts = module.TypeSystem;
+        var code = CopyHelpers(module, "EmbyNoShare.LiveWindowCode", "LiveWindowCode");
+        var enumerable = new TypeReference("System.Linq", "Enumerable", module, linqScope, valueType: false);
+        var ienum = new TypeReference("System.Collections.Generic", "IEnumerable`1", module, ts.CoreLibrary, valueType: false);
+        MethodReference Generic(string name, bool withCount, bool returnsArray)
+        {
+            var m = new MethodReference(name, ts.Void, enumerable) { HasThis = false };
+            var t = new GenericParameter("TSource", m);
+            m.GenericParameters.Add(t);
+            var seq = new GenericInstanceType(ienum); seq.GenericArguments.Add(t);
+            m.ReturnType = returnsArray ? new ArrayType(t) : seq;
+            m.Parameters.Add(new ParameterDefinition(seq));
+            if (withCount) m.Parameters.Add(new ParameterDefinition(ts.Int32));
+            var gi = new GenericInstanceMethod(m);
+            gi.GenericArguments.Add(segType);
+            return gi;
+        }
+        var takeLast = Generic("TakeLast", true, false);
+        var toArray = Generic("ToArray", false, true);
+        var p = method.Body.GetILProcessor();
+        var at = store;
+        foreach (var ins in new[] {
+            p.Create(OpCodes.Ldloc, arr), p.Create(OpCodes.Ldarg, method.Parameters[3]), p.Create(OpCodes.Call, code["Keep"]),
+            p.Create(OpCodes.Call, takeLast), p.Create(OpCodes.Call, toArray), p.Create(OpCodes.Stloc, arr) })
+        {
+            p.InsertAfter(at, ins);
+            at = ins;
+        }
+    };
+}
+
 static Action? PrepareLiveHlsWindow(ModuleDefinition module)
 {
     var service = module.GetType("Emby.Server.MediaEncoding.Api.Hls.BaseHlsService") ?? throw new Exception("No se encuentra BaseHlsService");
-    var method = service.Methods.SingleOrDefault(m => m.Name == "GetLivePlaylistText") ?? throw new Exception("No se encuentra GetLivePlaylistText");
+    var method = FindLivePlaylistText(service);
     if (method.IsStatic || method.Parameters.Count != 4 || method.Parameters[1].ParameterType.Name != "TranscodingJob" || method.Parameters[3].ParameterType.FullName != "System.Int32")
         throw new Exception("Firma inesperada de GetLivePlaylistText");
     var il = method.Body.Instructions;
+    if (il.Any(i => i.Operand is MethodReference g && g.Name == "GetLivePlaylistSegments"))
+        return LiveHlsWindowSegments(module, method);
     bool Has(string text) => il.Any(i => i.OpCode == OpCodes.Ldstr && (string)i.Operand == text);
     if (!Has("#EXT-X-PLAYLIST-TYPE:EVENT") || !Has("#EXT-X-MEDIA-SEQUENCE:0")) throw new Exception("GetLivePlaylistText no escribe EVENT / MEDIA-SEQUENCE:0");
     // newobj StringBuilder; stloc.N
@@ -1444,7 +1607,9 @@ static Action? PrepareLiveFastOpen(ModuleDefinition module)
     var count = ins.Where(i => i.OpCode == OpCodes.Ldc_I4_2
         && i.Previous.Operand is FieldReference fr && fr.Name.Contains("numSegments")
         && (i.Next.OpCode == OpCodes.Blt || i.Next.OpCode == OpCodes.Blt_S)).ToList();
-    if (seconds.Count != 1 || count.Count != 1)
+    // Emby 4.11.0.19 ya no espera a tener segmentos completos para dar el canal por abierto (espera a leer las
+    // pistas del propio stream), así que ahí solo queda la duración de los segmentos
+    if (seconds.Count != 1 || count.Count > 1)
         throw new Exception($"Patrón inesperado en SharedHttpPipelineSource.OpenInternal ({seconds.Count}, {count.Count})");
     Console.WriteLine($"[live-fast-open] {moveNext.FullName}");
 
@@ -1457,9 +1622,12 @@ static Action? PrepareLiveFastOpen(ModuleDefinition module)
         s.OpCode = OpCodes.Call;
         s.Operand = segmentSeconds;
         moveNext.Body.GetILProcessor().InsertAfter(s, Instruction.Create(OpCodes.Conv_R8));
-        var c = count[0];
-        c.OpCode = OpCodes.Call;
-        c.Operand = openSegments;
+        if (count.Count == 1)
+        {
+            var c = count[0];
+            c.OpCode = OpCodes.Call;
+            c.Operand = openSegments;
+        }
     };
 }
 
@@ -1509,10 +1677,38 @@ static MethodDefinition EnvInt(ModuleDefinition module, TypeDefinition owner, st
     return method;
 }
 
+/// EncodingHelpers: en Emby.Server.MediaEncoding.dll hasta 4.11.0.9; en 4.11.0.19, en Emby.MediaEncoding.Logic.dll (con
+/// los nombres privados ofuscados). null si en esta DLL no está pero sí en la otra (el parche va allí).
+static TypeDefinition? FindEncodingHelpers(ModuleDefinition module, string patch)
+{
+    var t = module.GetType("Emby.Server.MediaEncoding.Encoder.EncodingHelpers") ?? module.GetType("Emby.MediaEncoding.Encoder.EncodingHelpers");
+    if (t != null) return t;
+    var dir = Path.GetDirectoryName(module.FileName) ?? ".";
+    if (module.Assembly.Name.Name == "Emby.Server.MediaEncoding" && File.Exists(Path.Combine(dir, "Emby.MediaEncoding.Logic.dll")))
+    {
+        Console.WriteLine($"[{patch}] en esta versión de Emby va en Emby.MediaEncoding.Logic.dll");
+        return null;
+    }
+    throw new Exception("No se encuentra EncodingHelpers");
+}
+
+/// Método estático de EncodingHelpers por nombre o, con los nombres ofuscados, por firma y por lo que llama
+static MethodDefinition FindHelperMethod(TypeDefinition helpers, string name, string[] paramTypes, string calls)
+{
+    var byName = helpers.Methods.SingleOrDefault(m => m.Name == name);
+    if (byName != null) return byName;
+    var found = helpers.Methods.Where(m => m.IsStatic && m.HasBody && !IsReadable(m.Name) && m.Parameters.Count == paramTypes.Length
+        && m.Parameters.Select(x => x.ParameterType.Name).SequenceEqual(paramTypes)
+        && m.Body.Instructions.Any(i => i.Operand is MethodReference r && r.Name == calls)).ToList();
+    if (found.Count != 1) throw new Exception($"No se encuentra {name} ({found.Count} candidatos)");
+    return found[0];
+}
+
 static Action? PrepareLiveSubtitlesAll(ModuleDefinition module)
 {
-    var helpers = module.GetType("Emby.Server.MediaEncoding.Encoder.EncodingHelpers") ?? throw new Exception("No se encuentra EncodingHelpers");
-    var method = helpers.Methods.SingleOrDefault(m => m.Name == "GetEligibleSubtitleStreamIndexes") ?? throw new Exception("No se encuentra GetEligibleSubtitleStreamIndexes");
+    var helpers = FindEncodingHelpers(module, "live-subtitles-all");
+    if (helpers == null) return null;
+    var method = FindHelperMethod(helpers, "GetEligibleSubtitleStreamIndexes", new[] { "BaseEncodingJobOptions", "MediaSourceInfo" }, "get_SubtitleStreamIndexes");
     if (!method.IsStatic || method.Parameters.Count != 2 || method.Parameters[1].ParameterType.Name != "MediaSourceInfo")
         throw new Exception("Firma inesperada de GetEligibleSubtitleStreamIndexes");
     var reqType = method.Parameters[0].ParameterType.Resolve() ?? throw new Exception("No se resuelve el tipo de la petición");
@@ -1562,28 +1758,57 @@ static Action? PrepareLiveSubtitlesAll(ModuleDefinition module)
     };
 }
 
+/// EncodingManager.GetTranscodingJob(string playSessionId); con los nombres ofuscados (Emby 4.11.0.19), el único método
+/// de instancia (string) -> TranscodingJob
+static MethodDefinition FindGetTranscodingJob(TypeDefinition manager)
+{
+    var byName = manager.Methods.SingleOrDefault(m => m.Name == "GetTranscodingJob" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.FullName == "System.String");
+    if (byName != null) return byName;
+    var found = manager.Methods.Where(m => !m.IsStatic && m.HasBody && !IsReadable(m.Name) && m.ReturnType.Name == "TranscodingJob"
+        && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.FullName == "System.String").ToList();
+    if (found.Count != 1) throw new Exception($"No se encuentra GetTranscodingJob(string) ({found.Count} candidatos)");
+    return found[0];
+}
+
+static bool IsGetJob(MethodReference m, MethodDefinition getJob) =>
+    m.Name == getJob.Name && m.Parameters.Count == 1 && m.DeclaringType.FullName == getJob.DeclaringType.FullName;
+
+/// State machine de BaseHlsService.Get(GetLiveSubtitlePlaylist)
+static List<TypeDefinition> SubtitlePlaylistStateMachines(TypeDefinition service)
+{
+    var byName = service.NestedTypes.Where(t => t.Name.StartsWith("<Get>") && t.Fields.Any(f => f.Name == "request" && f.FieldType.Name == "GetLiveSubtitlePlaylist")).ToList();
+    if (byName.Count > 0) return byName;
+    return service.Methods.Where(m => m.Name == "Get" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.Name == "GetLiveSubtitlePlaylist")
+        .Select(StateMachineOf).Where(t => t != null).Select(t => t!).Distinct().ToList();
+}
+
 static Action? PrepareLiveSubtitlesJob(ModuleDefinition module)
 {
     var manager = module.GetType("Emby.Server.MediaEncoding.Api.EncodingManager") ?? throw new Exception("No se encuentra EncodingManager");
-    var getJob = manager.Methods.SingleOrDefault(m => m.Name == "GetTranscodingJob" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.FullName == "System.String")
-        ?? throw new Exception("No se encuentra GetTranscodingJob(string)");
+    var getJob = FindGetTranscodingJob(manager);
     var register = manager.Methods.SingleOrDefault(m => m.Name == "RegisterSegmentedPlaySession" && m.Parameters.Count == 2) ?? throw new Exception("No se encuentra RegisterSegmentedPlaySession");
-    var jobsField = manager.Fields.SingleOrDefault(f => f.Name == "_activeTranscodingJobs") ?? throw new Exception("No se encuentra _activeTranscodingJobs");
+    var jobsField = manager.Fields.SingleOrDefault(f => f.Name == "_activeTranscodingJobs")
+        ?? getJob.Body.Instructions.Select(i => i.Operand).OfType<FieldReference>().Select(f => f.Resolve())
+            .FirstOrDefault(f => f != null && f.DeclaringType == manager && f.FieldType is GenericInstanceType g && g.ElementType.FullName == "System.Collections.Generic.List`1")
+        ?? throw new Exception("No se encuentra _activeTranscodingJobs");
     if (jobsField.FieldType is not GenericInstanceType jobsList || jobsList.ElementType.FullName != "System.Collections.Generic.List`1") throw new Exception("_activeTranscodingJobs no es una List");
     var job = getJob.ReturnType.Resolve() ?? throw new Exception("No se resuelve TranscodingJob");
     var jobLive = job.Properties.SingleOrDefault(p => p.Name == "LiveStreamId")?.GetMethod ?? throw new Exception("No se encuentra TranscodingJob.LiveStreamId");
     var jobState = job.Properties.SingleOrDefault(p => p.Name == "OriginalState")?.GetMethod ?? throw new Exception("No se encuentra TranscodingJob.OriginalState");
-    if (jobState.ReturnType.FullName != register.Parameters[1].ParameterType.FullName) throw new Exception("OriginalState no es un StreamState");
+    // En Emby 4.11.0.19 OriginalState es un EncodingJobInfo (de otra DLL) y lo que guarda es un StreamState: se convierte
+    var stateType = register.Parameters[1].ParameterType;
+    bool castState = jobState.ReturnType.FullName != stateType.FullName;
+    if (castState && stateType.Resolve()?.BaseType?.FullName != jobState.ReturnType.FullName) throw new Exception("OriginalState no es un StreamState");
     var playlist = module.GetType("Emby.Server.MediaEncoding.Api.Hls.BaseGetSubtitlePlaylist") ?? throw new Exception("No se encuentra BaseGetSubtitlePlaylist");
     var reqPlay = playlist.Properties.SingleOrDefault(p => p.Name == "PlaySessionId")?.GetMethod ?? throw new Exception("No se encuentra PlaySessionId");
     var reqLive = playlist.Properties.SingleOrDefault(p => p.Name == "LiveStreamId")?.GetMethod ?? throw new Exception("No se encuentra LiveStreamId");
     var service = module.GetType("Emby.Server.MediaEncoding.Api.Hls.BaseHlsService") ?? throw new Exception("No se encuentra BaseHlsService");
-    var sms = service.NestedTypes.Where(t => t.Name.StartsWith("<Get>") && t.Fields.Any(f => f.Name == "request" && f.FieldType.Name == "GetLiveSubtitlePlaylist")).ToList();
+    var sms = SubtitlePlaylistStateMachines(service);
     if (sms.Count != 1) throw new Exception($"Se esperaba 1 state machine de Get(GetLiveSubtitlePlaylist), hay {sms.Count}");
-    var moveNext = sms[0].Methods.Single(m => m.Name == "MoveNext");
+    var moveNext = MoveNextOf(sms[0]);
     var il = moveNext.Body.Instructions;
     // ... ldfld request; callvirt get_PlaySessionId; callvirt EncodingManager::GetTranscodingJob(string)   (2 veces)
-    var calls = il.Where(i => i.OpCode == OpCodes.Callvirt && i.Operand is MethodReference m && m.Name == "GetTranscodingJob" && m.Parameters.Count == 1
+    var calls = il.Where(i => i.OpCode == OpCodes.Callvirt && i.Operand is MethodReference m && IsGetJob(m, getJob)
                               && i.Previous is { OpCode.Code: Code.Callvirt, Operand: MethodReference pm } && pm.Name == "get_PlaySessionId").ToList();
     if (calls.Count != 2) throw new Exception($"Se esperaban 2 búsquedas de la conversión por PlaySessionId, hay {calls.Count}");
     var pathCalls = il.Where(i => i.Operand is MethodReference m && m.Name == "GetSubtitleVariantPlaylistPath").ToList();
@@ -1708,6 +1933,7 @@ static Action? PrepareLiveSubtitlesJob(ModuleDefinition module)
         h.Append(h.Create(OpCodes.Ldloc, vI));
         h.Append(h.Create(OpCodes.Ldelem_Ref));
         h.Append(h.Create(OpCodes.Callvirt, module.ImportReference(jobState)));
+        if (castState) h.Append(h.Create(OpCodes.Isinst, stateType));
         h.Append(h.Create(OpCodes.Brfalse, retJob));
         h.Append(h.Create(OpCodes.Ldarg_0));
         h.Append(h.Create(OpCodes.Ldarg_1));
@@ -1716,6 +1942,7 @@ static Action? PrepareLiveSubtitlesJob(ModuleDefinition module)
         h.Append(h.Create(OpCodes.Ldloc, vI));
         h.Append(h.Create(OpCodes.Ldelem_Ref));
         h.Append(h.Create(OpCodes.Callvirt, module.ImportReference(jobState)));
+        if (castState) h.Append(h.Create(OpCodes.Castclass, stateType));
         h.Append(h.Create(OpCodes.Call, register));
         h.Append(retJob);                                                // ldloc all
         h.Append(h.Create(OpCodes.Ldloc, vI));
@@ -1816,8 +2043,9 @@ static Action? PrepareLiveSubtitlesJob(ModuleDefinition module)
 // respuesta sin tocar el códec, y el subtítulo sale convertido por OCR en la lista HLS.
 static Action? PrepareSubtitlesOcrKeepCodec(ModuleDefinition module)
 {
-    var helpers = module.GetType("Emby.Server.MediaEncoding.Encoder.EncodingHelpers") ?? throw new Exception("No se encuentra EncodingHelpers");
-    var method = helpers.Methods.SingleOrDefault(m => m.Name == "SetStateSubtitleStreams") ?? throw new Exception("No se encuentra SetStateSubtitleStreams");
+    var helpers = FindEncodingHelpers(module, "subtitles-ocr-keep-codec");
+    if (helpers == null) return null;
+    var method = FindHelperMethod(helpers, "SetStateSubtitleStreams", new[] { "EncodingJobInfo", "MediaSourceInfo", "List`1", "IFfmpegManager" }, "SupportsSubtitleConversionTo");
     var calls = method.Body.Instructions.Where(i => (i.OpCode == OpCodes.Callvirt || i.OpCode == OpCodes.Call)
         && i.Operand is MethodReference m && m.Name == "SupportsSubtitleConversionTo" && m.Parameters.Count == 5).ToList();
     if (calls.Count != 1) throw new Exception($"Se esperaba 1 llamada a SupportsSubtitleConversionTo, hay {calls.Count}");
@@ -2247,9 +2475,9 @@ static Action? PrepareLiveSubtitlesList(ModuleDefinition module)
     var service = module.GetType("Emby.Server.MediaEncoding.Api.Hls.BaseHlsService") ?? throw new Exception("No se encuentra BaseHlsService");
     var stub = service.Methods.SingleOrDefault(m => m.Name == "Get" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.Name == "GetLiveSubtitlePlaylist")
         ?? throw new Exception("No se encuentra Get(GetLiveSubtitlePlaylist)");
-    var sms = service.NestedTypes.Where(t => t.Name.StartsWith("<Get>") && t.Fields.Any(f => f.Name == "request" && f.FieldType.Name == "GetLiveSubtitlePlaylist")).ToList();
+    var sms = SubtitlePlaylistStateMachines(service);
     if (sms.Count != 1) throw new Exception($"Se esperaba 1 state machine de Get(GetLiveSubtitlePlaylist), hay {sms.Count}");
-    var il = sms[0].Methods.Single(m => m.Name == "MoveNext").Body.Instructions;
+    var il = MoveNextOf(sms[0]).Body.Instructions;
     MethodReference Ref(Func<MethodReference, bool> f, string what) =>
         il.Select(i => i.Operand).OfType<MethodReference>().FirstOrDefault(f) ?? throw new Exception("No se encuentra " + what);
     var getResult = Ref(m => m.Name == "GetResult" && m.Parameters.Count == 4, "GetResult");
@@ -2275,7 +2503,7 @@ static Action? PrepareLiveSubtitlesList(ModuleDefinition module)
     if (hostType.Resolve()?.Properties.Any(p => p.Name == "HttpPort" && p.PropertyType.FullName == "System.Int32") != true)
         throw new Exception("No se encuentra IServerApplicationHost.HttpPort");
     var manager = module.GetType("Emby.Server.MediaEncoding.Api.EncodingManager") ?? throw new Exception("No se encuentra EncodingManager");
-    var getJob = manager.Methods.Single(m => m.Name == "GetTranscodingJob" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.FullName == "System.String");
+    var getJob = FindGetTranscodingJob(manager);
     var jobType = getJob.ReturnType.Resolve() ?? throw new Exception("No se resuelve TranscodingJob");
     var jobPath = jobType.Properties.Single(p => p.Name == "Path").GetMethod;
     var reqType = stub.Parameters[0].ParameterType.Resolve();
@@ -2283,6 +2511,9 @@ static Action? PrepareLiveSubtitlesList(ModuleDefinition module)
     var dynamic = module.GetType("Emby.Server.MediaEncoding.Api.Hls.DynamicHlsService") ?? throw new Exception("No se encuentra DynamicHlsService");
     var segText = dynamic.Methods.SingleOrDefault(m => m.Name == "GetSubtitleSegmentText" && m.IsStatic && m.Parameters.Count >= 2
         && m.Parameters[1].ParameterType.FullName == "System.String" && m.Parameters[1].Name == "segmentPath")
+        // Emby 4.11.0.19: nombre ofuscado; el único estático (IFileSystem, string segmentPath, ...) -> Task
+        ?? OneOrNull(dynamic.Methods.Where(m => m.IsStatic && !IsReadable(m.Name) && m.Parameters.Count >= 2 && m.Parameters[0].ParameterType.Name == "IFileSystem"
+            && m.Parameters[1].ParameterType.FullName == "System.String" && m.ReturnType.Name.StartsWith("Task")))
         ?? throw new Exception("No se encuentra DynamicHlsService.GetSubtitleSegmentText(fileSystem, segmentPath, ...)");
     if (stub.ReturnType is not GenericInstanceType taskOfObject || taskOfObject.GenericArguments[0].FullName != "System.Object")
         throw new Exception("Get(GetLiveSubtitlePlaylist) no devuelve Task<object>");
@@ -2411,9 +2642,9 @@ static Action? PrepareLiveSubtitlesList(ModuleDefinition module)
 static Action? PrepareLiveSubtitlesHeaders(ModuleDefinition module)
 {
     var service = module.GetType("Emby.Server.MediaEncoding.Api.Hls.BaseHlsService") ?? throw new Exception("No se encuentra BaseHlsService");
-    var sms = service.NestedTypes.Where(t => t.Name.StartsWith("<Get>") && t.Fields.Any(f => f.Name == "request" && f.FieldType.Name == "GetLiveSubtitlePlaylist")).ToList();
+    var sms = SubtitlePlaylistStateMachines(service);
     if (sms.Count != 1) throw new Exception($"Se esperaba 1 state machine de Get(GetLiveSubtitlePlaylist), hay {sms.Count}");
-    var moveNext = sms[0].Methods.Single(m => m.Name == "MoveNext");
+    var moveNext = MoveNextOf(sms[0]);
     static Instruction? SpanBeforeMime(MethodDefinition m) => m.Body.Instructions.SingleOrDefault(i => i.OpCode == OpCodes.Call
         && i.Operand is MethodReference r && r.Name == "AsSpan" && r.Parameters.Count == 1 && r.Parameters[0].ParameterType.FullName == "System.String"
         && i.Next is { OpCode.Code: Code.Ldstr } n && (string)n.Operand == "playlist.m3u8");
@@ -2461,9 +2692,9 @@ static Action? PrepareLiveSubtitlesNoWait(ModuleDefinition module)
     var service = module.GetType("Emby.Server.MediaEncoding.Api.Hls.BaseHlsService") ?? throw new Exception("No se encuentra BaseHlsService");
     var stub = service.Methods.SingleOrDefault(m => m.Name == "Get" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.Name == "GetLiveSubtitlePlaylist")
         ?? throw new Exception("No se encuentra Get(GetLiveSubtitlePlaylist)");
-    var sms = service.NestedTypes.Where(t => t.Name.StartsWith("<Get>") && t.Fields.Any(f => f.Name == "request" && f.FieldType.Name == "GetLiveSubtitlePlaylist")).ToList();
+    var sms = SubtitlePlaylistStateMachines(service);
     if (sms.Count != 1) throw new Exception($"Se esperaba 1 state machine de Get(GetLiveSubtitlePlaylist), hay {sms.Count}");
-    var il = sms[0].Methods.Single(m => m.Name == "MoveNext").Body.Instructions;
+    var il = MoveNextOf(sms[0]).Body.Instructions;
     MethodReference Ref(Func<MethodReference, bool> f, string what) =>
         il.Select(i => i.Operand).OfType<MethodReference>().FirstOrDefault(f) ?? throw new Exception("No se encuentra " + what);
     var getResult = Ref(m => m.Name == "GetResult" && m.Parameters.Count == 4, "GetResult");
@@ -2484,7 +2715,7 @@ static Action? PrepareLiveSubtitlesNoWait(ModuleDefinition module)
     var manager = module.GetType("Emby.Server.MediaEncoding.Api.EncodingManager") ?? throw new Exception("No se encuentra EncodingManager");
     bool hasJobPatch = manager.Methods.Any(m => m.Name == "EmbyNoShare_FindLiveJob")
         || module.Types.Any(t => t.FullName == "EmbyNoShare.LiveSubtitlesJob");
-    if (!hasJobPatch && !il.Any(i => i.Operand is MethodReference m && m.Name == "GetTranscodingJob"))
+    if (!hasJobPatch && !il.Any(i => i.Operand is MethodReference m && IsGetJob(m, FindGetTranscodingJob(manager))))
         throw new Exception("No se reconoce la búsqueda de la conversión");
     if (stub.ReturnType is not GenericInstanceType taskOfObject || taskOfObject.GenericArguments[0].FullName != "System.Object")
         throw new Exception("Get(GetLiveSubtitlePlaylist) no devuelve Task<object>");
@@ -2549,7 +2780,7 @@ static Action? PrepareLiveSubtitlesNoWait(ModuleDefinition module)
         {
             h.Append(h.Create(OpCodes.Callvirt, module.ImportReference(stub.Parameters[0].ParameterType.Resolve().Properties
                 .Concat(stub.Parameters[0].ParameterType.Resolve().BaseType.Resolve().Properties).First(p => p.Name == "PlaySessionId").GetMethod)));
-            h.Append(h.Create(OpCodes.Callvirt, module.ImportReference(manager.Methods.Single(m => m.Name == "GetTranscodingJob" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.FullName == "System.String"))));
+            h.Append(h.Create(OpCodes.Callvirt, module.ImportReference(FindGetTranscodingJob(manager))));
         }
         h.Append(h.Create(OpCodes.Stloc, vJob));
         h.Append(h.Create(OpCodes.Ldloc, vJob));
