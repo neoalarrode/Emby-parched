@@ -55,18 +55,34 @@ del usuario dueño:  `.../Grabaciones/<usuario>/<programa>/...`.
 - Sin dueño (grabaciones viejas o del propio servidor): va a una carpeta común
   `.../Grabaciones/_comunes/`, para no perder nada.
 
-### 3. Una biblioteca por usuario  (configuración, SIN parche)
-Cada carpeta `Grabaciones/<usuario>` se añade como biblioteca propia, y en los permisos de
-cada usuario se le da acceso solo a la suya. Esto ya existe en Emby; no hay que parchear.
-- Alternativa si se prefiere una sola biblioteca: un parche que filtre las grabaciones por
-  dueño al listar, pero es más frágil. Se prefiere la vía de permisos nativa.
+### 3. Una biblioteca por usuario, automática  (parche)
+Requisito del usuario: NADA a mano. Solo se configura UNA carpeta raíz de grabaciones en el
+DVR de Emby. Lo demás, solo:
+- La primera vez que un usuario graba (o al crear su primer timer), el parche crea su
+  subcarpeta `Grabaciones/<usuario>` si no existe.
+- Crea una biblioteca para esa subcarpeta si no existe (vía ILibraryManager.AddVirtualFolder /
+  AddMediaPath) y
+- Ajusta los permisos de ese usuario para que tenga acceso SOLO a su biblioteca de grabaciones
+  (y se la quita a los demás): en la configuración de usuario, EnableAllFolders=false y su
+  carpeta dentro de EnabledFolders; para los demás usuarios, su carpeta fuera de EnabledFolders.
+- Idempotente: si ya existe la carpeta, la biblioteca y el permiso, no hace nada.
+- Punto probable: engancharse en la creación del timer (pieza 1), que es cuando ya sabemos el
+  dueño, o en el arranque de la grabación. Mejor en la creación del timer: así la biblioteca
+  está lista antes de que termine de grabar.
+- A estudiar en el código real: nombre exacto de AddVirtualFolder/AddMediaPath y de los campos
+  de permisos de biblioteca por usuario (UserConfiguration/UserPolicy: EnableAllFolders,
+  EnabledFolders). Si crear bibliotecas desde ahí fuese inviable o arriesgado, se cae a la
+  vía de una sola biblioteca filtrada por dueño al listar (más frágil, segunda opción).
 
-### 4. Programación privada  (parche)
-En la guía y en la lista de grabaciones programadas, que cada usuario vea y cancele solo las
-suyas.
-- Punto probable: el método que devuelve la lista de timers/series-timers a la app
-  (GetTimers / GetSeriesTimers). Filtrar por el dueño (pieza 1) contra el usuario de la
-  petición. Un usuario administrador puede ver todas (a decidir).
+### 4. Programación privada y aislada  (parche)
+Cada usuario tiene su propio calendario y su propia programación. No ve, ni puede modificar o
+cancelar, la programación de otros.
+- Listar: el método que devuelve la lista de timers/series-timers a la app (GetTimers /
+  GetSeriesTimers). Filtrar por el dueño (pieza 1) contra el usuario de la petición.
+- Modificar/cancelar: los métodos de cancelar/editar timer (CancelTimer, CancelSeriesTimer,
+  UpdateTimer) tienen que comprobar que el timer es del usuario que lo pide; si no, denegar.
+  Esto es lo que impide que uno toque lo de otro, no solo que no lo vea.
+- Administrador: a decidir si ve y gestiona todo o también solo lo suyo.
 
 ### 5. Grabación única con enlaces  (parche, el más delicado)
 Si dos usuarios programan el mismo evento (mismo canal + mismo horario), no abrir dos
