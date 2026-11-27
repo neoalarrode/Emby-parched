@@ -151,10 +151,9 @@ namespace EmbyNoShare
         /// dueño o root es nulo, devuelve root sin tocar. owner = nombre de usuario (ProviderIds["OwnerUserId"]).</summary>
         public static string UserBase(string root, object timer)
         {
-            if (string.IsNullOrEmpty(root))
-                return root;
             string owner = GetOwnerId(timer);
-            if (string.IsNullOrEmpty(owner))
+            Trace("UserBase", "root=" + (root ?? "null") + " user=" + (owner ?? "null"));
+            if (string.IsNullOrEmpty(root) || string.IsNullOrEmpty(owner))
                 return root;
             try
             {
@@ -163,8 +162,9 @@ namespace EmbyNoShare
                     Directory.CreateDirectory(dir);
                 return dir;
             }
-            catch (Exception)
+            catch (Exception e)
             {
+                Trace("UserBase", "excepcion: " + e.Message);
                 return root;
             }
         }
