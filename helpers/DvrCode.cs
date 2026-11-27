@@ -147,6 +147,46 @@ namespace EmbyNoShare
             }
         }
 
+        /// <summary>Raíz de grabación por usuario: «&lt;root&gt;/&lt;owner&gt;», creando la carpeta. Si el timer no tiene
+        /// dueño o root es nulo, devuelve root sin tocar. owner = nombre de usuario (ProviderIds["OwnerUserId"]).</summary>
+        public static string UserBase(string root, object timer)
+        {
+            if (string.IsNullOrEmpty(root))
+                return root;
+            string owner = GetOwnerId(timer);
+            if (string.IsNullOrEmpty(owner))
+                return root;
+            try
+            {
+                string dir = Path.Combine(root, SafeName(owner));
+                if (!Directory.Exists(dir))
+                    Directory.CreateDirectory(dir);
+                return dir;
+            }
+            catch (Exception)
+            {
+                return root;
+            }
+        }
+
+        /// <summary>Nombre de carpeta válido a partir del nombre de usuario.</summary>
+        static string SafeName(string name)
+        {
+            if (string.IsNullOrEmpty(name))
+                return "_";
+            char[] bad = Path.GetInvalidFileNameChars();
+            var sb = new System.Text.StringBuilder(name.Length);
+            foreach (char c in name)
+            {
+                bool ok = true;
+                for (int i = 0; i < bad.Length; i++)
+                    if (bad[i] == c) { ok = false; break; }
+                sb.Append(ok ? c : '_');
+            }
+            string s = sb.ToString().Trim().TrimEnd('.');
+            return s.Length == 0 ? "_" : s;
+        }
+
         /// <summary>Si 'actor' (el usuario que pide la acción) no es el dueño del timer, lanza excepción. Si el timer
         /// no tiene dueño (grabaciones antiguas) o no hay actor (acción interna de Emby, no de una persona), deja pasar.</summary>
         public static void AssertOwner(object timer, string actor)

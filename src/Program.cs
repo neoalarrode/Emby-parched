@@ -144,6 +144,7 @@ var patches = new (string Assembly, string Marker, string Name, Func<ModuleDefin
     ("Emby.LiveTV", "DvrOwner", "dvr-owner", PrepareDvrOwner),
     ("Emby.LiveTV", "DvrLimit", "dvr-limit", PrepareDvrLimit),
     ("Emby.LiveTV", "DvrIsolation", "dvr-isolation", PrepareDvrIsolation),
+    ("Emby.LiveTV", "DvrFolder", "dvr-folder", PrepareDvrFolder),
     ("Emby.Server.MediaEncoding", "LiveSubtitlesAll", "live-subtitles-all", PrepareLiveSubtitlesAll),
     ("Emby.MediaEncoding.Logic", "LiveSubtitlesAll", "live-subtitles-all", PrepareLiveSubtitlesAll),
     ("Emby.Server.MediaEncoding", "LiveSubtitlesJob", "live-subtitles-job", PrepareLiveSubtitlesJob),
@@ -2848,6 +2849,56 @@ static Action? PrepareDvrIsolation(ModuleDefinition module)
         }
     };
 }
+
+// Grabaciones DVR por usuario, fase B (ruta): cada grabación cae en «&lt;raíz&gt;/&lt;usuario&gt;». EmbyTV.GetRecordingPath y
+// GetDefaultRecordingPathForSeries parten de parentFolder.Path como raíz; se envuelve esa raíz con DvrCode.UserBase,
+// que le añade la subcarpeta del usuario (del dueño del timer) y la crea. Las subcarpetas de programa/serie cuelgan ya
+// de ahí. El dueño se lee del propio timer (ProviderIds["OwnerUserId"]); sin dueño, la raíz no cambia.
+static Action? PrepareDvrFolder(ModuleDefinition module)
+{
+    var recPath = EmbyTvMethod(module, m => m.Name == "GetRecordingPath" && !m.IsStatic && m.Parameters.Count >= 3 && m.Parameters[0].ParameterType.Name == "TimerInfo", "EmbyTV.GetRecordingPath");
+    var seriesPath = EmbyTvMethod(module, m => m.Name == "GetDefaultRecordingPathForSeries" && m.Parameters.Any(p => p.ParameterType.Name == "BaseItem"), "EmbyTV.GetDefaultRecordingPathForSeries");
+    // índice del parámetro parentFolder (BaseItem) y del timer en cada método
+    int ParentArg(MethodDefinition m) => m.Parameters.ToList().FindIndex(p => p.ParameterType.Name == "BaseItem") + (m.IsStatic ? 0 : 1);
+    int TimerArg(MethodDefinition m) => m.Parameters.ToList().FindIndex(p => p.ParameterType.Name is "TimerInfo" or "BaseTimerInfo") + (m.IsStatic ? 0 : 1);
+    Console.WriteLine($"[dvr-folder] {recPath.FullName}; {seriesPath.FullName}");
+
+    return () =>
+    {
+        var code = EnsureDvrCode(module);
+        // Tras «ldarg.<parent>; callvirt get_Path», insertar «ldarg.<timer>; call UserBase» para que el stloc guarde la
+        // raíz con la subcarpeta del usuario. Se hace en el primer get_Path sobre parentFolder que alimenta un stloc.
+        void WrapBase(MethodDefinition method)
+        {
+            int parentArg = ParentArg(method);
+            int timerArg = TimerArg(method);
+            var il = method.Body.GetILProcessor();
+            var getPath = method.Body.Instructions.FirstOrDefault(i => (i.OpCode == OpCodes.Callvirt || i.OpCode == OpCodes.Call)
+                && i.Operand is MethodReference m && m.Name == "get_Path" && i.Previous != null && IsLdarg(i.Previous, parentArg)
+                && i.Next != null && (i.Next.OpCode == OpCodes.Stloc || i.Next.OpCode == OpCodes.Stloc_0 || i.Next.OpCode == OpCodes.Stloc_1
+                    || i.Next.OpCode == OpCodes.Stloc_2 || i.Next.OpCode == OpCodes.Stloc_3 || i.Next.OpCode == OpCodes.Stloc_S))
+                ?? throw new Exception($"No se encuentra «parentFolder.Path -> local» en {method.Name}");
+            il.InsertAfter(getPath, il.Create(OpCodes.Call, code["UserBase"]));
+            il.InsertAfter(getPath, Ldarg(il, timerArg));
+        }
+        WrapBase(recPath);
+        WrapBase(seriesPath);
+    };
+}
+
+static bool IsLdarg(Instruction i, int index) =>
+    (index == 0 && i.OpCode == OpCodes.Ldarg_0) || (index == 1 && i.OpCode == OpCodes.Ldarg_1)
+    || (index == 2 && i.OpCode == OpCodes.Ldarg_2) || (index == 3 && i.OpCode == OpCodes.Ldarg_3)
+    || ((i.OpCode == OpCodes.Ldarg || i.OpCode == OpCodes.Ldarg_S) && i.Operand is ParameterDefinition p && p.Sequence == index);
+
+static Instruction Ldarg(ILProcessor il, int index) => index switch
+{
+    0 => il.Create(OpCodes.Ldarg_0),
+    1 => il.Create(OpCodes.Ldarg_1),
+    2 => il.Create(OpCodes.Ldarg_2),
+    3 => il.Create(OpCodes.Ldarg_3),
+    _ => il.Create(OpCodes.Ldarg, il.Body.Method.Parameters[index - (il.Body.Method.IsStatic ? 0 : 1)]),
+};
 
 static Dictionary<string, MethodDefinition> CopyHelpers(ModuleDefinition module, string typeName, string name)
 {
