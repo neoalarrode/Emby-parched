@@ -10,7 +10,8 @@ namespace EmbyNoShare
     /// timer, así que sobrevive a los reinicios y no cambia el esquema de la base de datos del DVR).</summary>
     public static class DvrCode
     {
-        /// <summary>Id estable del usuario (su Guid Id; si no, InternalId). null si no se puede leer.</summary>
+        /// <summary>Identidad del usuario para el DVR: su nombre (el usuario no lo cambia, y así la carpeta de
+        /// grabaciones es «Grabaciones/&lt;nombre&gt;»). Si no se puede leer el nombre, cae al Id como respaldo.</summary>
         public static string GetUserId(object user)
         {
             if (user == null)
@@ -18,20 +19,20 @@ namespace EmbyNoShare
             try
             {
                 Type t = user.GetType();
-                PropertyInfo p = t.GetProperty("Id");
+                PropertyInfo p = t.GetProperty("Name");
                 object v = p != null ? p.GetValue(user) : null;
                 if (v != null)
                 {
                     string s = v.ToString();
-                    if (!string.IsNullOrEmpty(s) && s != Guid.Empty.ToString() && s != "0")
+                    if (!string.IsNullOrEmpty(s))
                         return s;
                 }
-                p = t.GetProperty("InternalId");
+                p = t.GetProperty("Id");
                 v = p != null ? p.GetValue(user) : null;
                 if (v != null)
                 {
                     string s = v.ToString();
-                    if (!string.IsNullOrEmpty(s) && s != "0")
+                    if (!string.IsNullOrEmpty(s) && s != Guid.Empty.ToString() && s != "0")
                         return s;
                 }
             }
