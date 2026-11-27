@@ -2510,6 +2510,9 @@ static Action? PrepareDvrOwner(ModuleDefinition module)
     var createTimer = EmbyTvMethod(module, m => m.Name == "CreateTimer" && !m.IsStatic && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.Name == "TimerInfo", "EmbyTV.CreateTimer(TimerInfo)");
     var createForSeries = EmbyTvMethod(module, m => m.Name == "CreateTimerInfoForSeries" && m.IsStatic && m.Parameters.Count >= 1 && m.Parameters[0].ParameterType.Name == "SeriesTimerInfo", "EmbyTV.CreateTimerInfoForSeries");
     var createSeries = EmbyTvMethod(module, m => m.Name == "CreateSeriesTimer" && !m.IsStatic && m.Parameters.Count >= 1 && m.Parameters[0].ParameterType.Name == "SeriesTimerInfo", "EmbyTV.CreateSeriesTimer");
+    // Refresco de guía: UpdateExistingTimerWithNewMetadata(existing, updated) copia updated.ProviderIds sobre
+    // existing y borraría el dueño. Se conserva: se lee al entrar y se repone al salir.
+    var updateExisting = EmbyTvMethod(module, m => m.Name == "UpdateExistingTimerWithNewMetadata" && m.IsStatic && m.Parameters.Count == 2 && m.Parameters[0].ParameterType.Name == "TimerInfo", "EmbyTV.UpdateExistingTimerWithNewMetadata");
     Console.WriteLine($"[dvr-owner] {createTimerApi.FullName}; {createTimer.FullName}; {createForSeries.FullName}");
 
     return () =>
@@ -2538,23 +2541,76 @@ static Action? PrepareDvrOwner(ModuleDefinition module)
         SetOwnerContext(createTimerApi);
         SetOwnerContext(createSeriesApi);
 
-        // En EmbyTV.CreateTimer(TimerInfo timer) y CreateSeriesTimer(SeriesTimerInfo info, ...):
-        //   DvrCode.SetOwnerId(arg1, DvrContext.Owner.Value);   (arg1 = el timer / la serie que se guarda)
-        void StampArg1(MethodDefinition method)
+        // El dueño se estampa JUSTO ANTES de guardar (no al principio): EmbyTV.CreateTimer copia los datos del
+        // programa al timer (timer.ProviderIds = programa.ProviderIds) y borraría un estampado anterior. Se busca la
+        // llamada a _timerProvider.Add(timer) (ItemDataProvider.Add) y se inserta antes:
+        //   DvrCode.SetOwnerFresh(timer, DvrContext.Owner.Value);
+        void StampBeforeSave(MethodDefinition method, string saveMethod)
         {
+            var addCall = method.Body.Instructions.FirstOrDefault(i =>
+                (i.OpCode == OpCodes.Callvirt || i.OpCode == OpCodes.Call) && i.Operand is MethodReference m && m.Name == saveMethod
+                && m.Parameters.Count == 1 && i.Previous != null && i.Previous.OpCode == OpCodes.Ldarg_1)
+                ?? throw new Exception($"No se encuentra la llamada {saveMethod}(arg1) en {method.Name}");
+            // inicio de la sentencia: ...Add -> ldarg.1 -> ldfld _timerProvider -> ldarg.0
+            var stmtStart = addCall.Previous.Previous.Previous;
+            if (stmtStart == null || stmtStart.OpCode != OpCodes.Ldarg_0)
+                throw new Exception($"Patrón inesperado antes de {saveMethod} en {method.Name}");
             var il = method.Body.GetILProcessor();
-            var first = method.Body.Instructions[0];
             foreach (var ins in new[]
             {
                 il.Create(OpCodes.Ldarg_1),
                 il.Create(OpCodes.Ldsfld, ctx.Owner),
                 il.Create(OpCodes.Callvirt, al.Get),
-                il.Create(OpCodes.Call, code["SetOwnerId"]),
+                il.Create(OpCodes.Call, code["SetOwnerFresh"]),
+            })
+                il.InsertBefore(stmtStart, ins);
+        }
+        StampBeforeSave(createTimer, "Add");
+
+        // CreateSeriesTimer: la serie se estampa al principio (no la pisa ninguna copia de programa) con SetOwnerFresh.
+        {
+            var il = createSeries.Body.GetILProcessor();
+            var first = createSeries.Body.Instructions[0];
+            foreach (var ins in new[]
+            {
+                il.Create(OpCodes.Ldarg_1),
+                il.Create(OpCodes.Ldsfld, ctx.Owner),
+                il.Create(OpCodes.Callvirt, al.Get),
+                il.Create(OpCodes.Call, code["SetOwnerFresh"]),
             })
                 il.InsertBefore(first, ins);
         }
-        StampArg1(createTimer);
-        StampArg1(createSeries);
+
+        // En EmbyTV.UpdateExistingTimerWithNewMetadata(existing /*arg0*/, updated): conservar el dueño de 'existing'
+        // (se lee al entrar en una variable y se repone antes de cada ret, tras la copia que lo borra).
+        {
+            var il = updateExisting.Body.GetILProcessor();
+            var ownerLoc = new VariableDefinition(module.TypeSystem.String);
+            updateExisting.Body.Variables.Add(ownerLoc);
+            updateExisting.Body.InitLocals = true;
+            var first = updateExisting.Body.Instructions[0];
+            foreach (var ins in new[]
+            {
+                il.Create(OpCodes.Ldarg_0),
+                il.Create(OpCodes.Call, code["GetOwnerId"]),
+                il.Create(OpCodes.Stloc, ownerLoc),
+            })
+                il.InsertBefore(first, ins);
+            foreach (var ret in updateExisting.Body.Instructions.Where(i => i.OpCode == OpCodes.Ret).ToList())
+            {
+                var restore = il.Create(OpCodes.Ldarg_0);
+                il.InsertBefore(ret, restore);
+                il.InsertBefore(ret, il.Create(OpCodes.Ldloc, ownerLoc));
+                il.InsertBefore(ret, il.Create(OpCodes.Call, code["SetOwnerFresh"]));
+                foreach (var i in updateExisting.Body.Instructions)
+                    if (i.Operand == ret && i != restore) i.Operand = restore;
+                foreach (var eh in updateExisting.Body.ExceptionHandlers)
+                {
+                    if (eh.HandlerEnd == ret) eh.HandlerEnd = restore;
+                    if (eh.TryEnd == ret) eh.TryEnd = restore;
+                }
+            }
+        }
 
         // En EmbyTV.CreateTimerInfoForSeries(series, ...) -> TimerInfo: copiar el dueño de la serie al timer devuelto.
         {

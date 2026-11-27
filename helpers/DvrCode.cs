@@ -86,6 +86,35 @@ namespace EmbyNoShare
             }
         }
 
+        /// <summary>Estampa el dueño en un ProviderIds PROPIO del timer (clona el actual en uno nuevo del mismo tipo y
+        /// le añade OwnerUserId), para que no se comparta con el del programa (CopyProgramInfoToTimerInfo hace
+        /// timer.ProviderIds = programa.ProviderIds). Se llama justo antes de guardar, tras la copia del programa.</summary>
+        public static void SetOwnerFresh(object timer, string ownerId)
+        {
+            Trace("SetOwnerFresh", "owner=" + (ownerId ?? "null"));
+            if (ownerId == null || timer == null)
+                return;
+            try
+            {
+                PropertyInfo prop = timer.GetType().GetProperty("ProviderIds");
+                if (prop == null)
+                    return;
+                object current = prop.GetValue(timer);
+                Type dictType = current != null ? current.GetType() : prop.PropertyType;
+                IDictionary fresh = Activator.CreateInstance(dictType) as IDictionary;
+                if (fresh == null)
+                    return;
+                if (current is IDictionary cur)
+                    foreach (DictionaryEntry e in cur)
+                        fresh[e.Key] = e.Value;
+                fresh["OwnerUserId"] = ownerId;
+                prop.SetValue(timer, fresh);
+            }
+            catch (Exception)
+            {
+            }
+        }
+
         public static string GetOwnerId(object timer)
         {
             try
