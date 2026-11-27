@@ -97,6 +97,17 @@ namespace EmbyNoShare
             }
         }
 
+        /// <summary>Si 'actor' (el usuario que pide la acción) no es el dueño del timer, lanza excepción. Si el timer
+        /// no tiene dueño (grabaciones antiguas) o no hay actor (acción interna de Emby, no de una persona), deja pasar.</summary>
+        public static void AssertOwner(object timer, string actor)
+        {
+            if (actor == null || timer == null)
+                return;
+            string owner = GetOwnerId(timer);
+            if (owner != null && !string.Equals(owner, actor, StringComparison.Ordinal))
+                throw new InvalidOperationException("Esta grabacion es de otro usuario.");
+        }
+
         static object Policy(object user)
         {
             if (user == null)

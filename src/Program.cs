@@ -143,6 +143,7 @@ var patches = new (string Assembly, string Marker, string Name, Func<ModuleDefin
     ("Emby.LiveTV", "LiveHeartbeat", "live-heartbeat", PrepareLiveHeartbeat),
     ("Emby.LiveTV", "DvrOwner", "dvr-owner", PrepareDvrOwner),
     ("Emby.LiveTV", "DvrLimit", "dvr-limit", PrepareDvrLimit),
+    ("Emby.LiveTV", "DvrIsolation", "dvr-isolation", PrepareDvrIsolation),
     ("Emby.Server.MediaEncoding", "LiveSubtitlesAll", "live-subtitles-all", PrepareLiveSubtitlesAll),
     ("Emby.MediaEncoding.Logic", "LiveSubtitlesAll", "live-subtitles-all", PrepareLiveSubtitlesAll),
     ("Emby.Server.MediaEncoding", "LiveSubtitlesJob", "live-subtitles-job", PrepareLiveSubtitlesJob),
@@ -2423,21 +2424,23 @@ static (TypeReference Inst, MethodReference Ctor, MethodReference Get, MethodRef
 //       public static AsyncLocal<int>    Limit = new();   // su límite de grabaciones a la vez (0 = sin límite)
 //   }
 // Idempotente: lo crea una vez y lo reutilizan dvr-owner y dvr-limit, en cualquier orden.
-static (TypeDefinition Holder, FieldReference Owner, FieldReference Limit) EnsureDvrContext(ModuleDefinition module)
+static (TypeDefinition Holder, FieldReference Owner, FieldReference Limit, FieldReference Actor) EnsureDvrContext(ModuleDefinition module)
 {
     var ts = module.TypeSystem;
     var holder = module.GetType("EmbyNoShare.DvrContext");
     if (holder != null)
-        return (holder, holder.Fields.Single(f => f.Name == "Owner"), holder.Fields.Single(f => f.Name == "Limit"));
+        return (holder, holder.Fields.Single(f => f.Name == "Owner"), holder.Fields.Single(f => f.Name == "Limit"), holder.Fields.Single(f => f.Name == "Actor"));
     var alStr = AsyncLocalRefs(module, ts.String);
     var alInt = AsyncLocalRefs(module, ts.Int32);
     holder = new TypeDefinition("EmbyNoShare", "DvrContext",
         TypeAttributes.NotPublic | TypeAttributes.Abstract | TypeAttributes.Sealed | TypeAttributes.BeforeFieldInit, ts.Object);
     module.Types.Add(holder);
-    var owner = new FieldDefinition("Owner", FieldAttributes.Public | FieldAttributes.Static, alStr.Inst);
-    var limit = new FieldDefinition("Limit", FieldAttributes.Public | FieldAttributes.Static, alInt.Inst);
+    var owner = new FieldDefinition("Owner", FieldAttributes.Public | FieldAttributes.Static, alStr.Inst);  // dueño del timer que se crea
+    var limit = new FieldDefinition("Limit", FieldAttributes.Public | FieldAttributes.Static, alInt.Inst);  // su límite de simultáneas
+    var actor = new FieldDefinition("Actor", FieldAttributes.Public | FieldAttributes.Static, alStr.Inst);  // usuario que pide cancelar/editar
     holder.Fields.Add(owner);
     holder.Fields.Add(limit);
+    holder.Fields.Add(actor);
     var cctor = new MethodDefinition(".cctor",
         MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig | MethodAttributes.SpecialName | MethodAttributes.RTSpecialName, ts.Void);
     var ci = cctor.Body.GetILProcessor();
@@ -2445,9 +2448,11 @@ static (TypeDefinition Holder, FieldReference Owner, FieldReference Limit) Ensur
     ci.Append(ci.Create(OpCodes.Stsfld, owner));
     ci.Append(ci.Create(OpCodes.Newobj, alInt.Ctor));
     ci.Append(ci.Create(OpCodes.Stsfld, limit));
+    ci.Append(ci.Create(OpCodes.Newobj, alStr.Ctor));
+    ci.Append(ci.Create(OpCodes.Stsfld, actor));
     ci.Append(ci.Create(OpCodes.Ret));
     holder.Methods.Add(cctor);
-    return (holder, owner, limit);
+    return (holder, owner, limit, actor);
 }
 
 // Copia del helper DvrCode (una sola vez): si ya está, devuelve sus métodos; si no, lo copia con CopyHelpers.
@@ -2488,6 +2493,7 @@ static Action? PrepareDvrOwner(ModuleDefinition module)
     var getUserRef = GetUserForRequestRef(module, service);
     var createTimer = EmbyTvMethod(module, m => m.Name == "CreateTimer" && !m.IsStatic && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.Name == "TimerInfo", "EmbyTV.CreateTimer(TimerInfo)");
     var createForSeries = EmbyTvMethod(module, m => m.Name == "CreateTimerInfoForSeries" && m.IsStatic && m.Parameters.Count >= 1 && m.Parameters[0].ParameterType.Name == "SeriesTimerInfo", "EmbyTV.CreateTimerInfoForSeries");
+    var createSeries = EmbyTvMethod(module, m => m.Name == "CreateSeriesTimer" && !m.IsStatic && m.Parameters.Count >= 1 && m.Parameters[0].ParameterType.Name == "SeriesTimerInfo", "EmbyTV.CreateSeriesTimer");
     Console.WriteLine($"[dvr-owner] {createTimerApi.FullName}; {createTimer.FullName}; {createForSeries.FullName}");
 
     return () =>
@@ -2516,10 +2522,12 @@ static Action? PrepareDvrOwner(ModuleDefinition module)
         SetOwnerContext(createTimerApi);
         SetOwnerContext(createSeriesApi);
 
-        // En EmbyTV.CreateTimer(TimerInfo timer): DvrCode.SetOwnerId(timer, DvrContext.Owner.Value);
+        // En EmbyTV.CreateTimer(TimerInfo timer) y CreateSeriesTimer(SeriesTimerInfo info, ...):
+        //   DvrCode.SetOwnerId(arg1, DvrContext.Owner.Value);   (arg1 = el timer / la serie que se guarda)
+        void StampArg1(MethodDefinition method)
         {
-            var il = createTimer.Body.GetILProcessor();
-            var first = createTimer.Body.Instructions[0];
+            var il = method.Body.GetILProcessor();
+            var first = method.Body.Instructions[0];
             foreach (var ins in new[]
             {
                 il.Create(OpCodes.Ldarg_1),
@@ -2529,6 +2537,8 @@ static Action? PrepareDvrOwner(ModuleDefinition module)
             })
                 il.InsertBefore(first, ins);
         }
+        StampArg1(createTimer);
+        StampArg1(createSeries);
 
         // En EmbyTV.CreateTimerInfoForSeries(series, ...) -> TimerInfo: copiar el dueño de la serie al timer devuelto.
         {
@@ -2619,6 +2629,61 @@ static Action? PrepareDvrLimit(ModuleDefinition module)
                 il.Create(OpCodes.Ldsfld, ctx.Limit),
                 il.Create(OpCodes.Callvirt, alInt.Get),
                 il.Create(OpCodes.Call, code["CheckLimit"]),
+            })
+                il.InsertBefore(first, ins);
+        }
+    };
+}
+
+// Grabaciones DVR por usuario, fase A: nadie puede cancelar la grabación de otro. Al pedir cancelar (timer o serie),
+// la API apunta en DvrContext.Actor quién lo pide, y EmbyTV.CancelTimerInternal (que ya tiene el timer con su dueño, y
+// por el que pasan también las cancelaciones de una serie) lanza error si el que pide no es el dueño. Las cancelaciones
+// internas de Emby (conflictos, programador) no ponen Actor, así que no se tocan. Depende de dvr-owner para el dueño.
+static Action? PrepareDvrIsolation(ModuleDefinition module)
+{
+    var service = module.GetType("Emby.LiveTV.Api.LiveTvService") ?? throw new Exception("No se encuentra LiveTvService");
+    var cancelTimerApi = DvrHandler(service, "CancelTimer");
+    var cancelSeriesApi = DvrHandler(service, "CancelSeriesTimer");
+    var getUserRef = GetUserForRequestRef(module, service);
+    var cancelInternal = EmbyTvMethod(module, m => m.Name == "CancelTimerInternal" && !m.IsStatic && m.Parameters.Count >= 2 && m.Parameters[1].ParameterType.Name == "TimerInfo", "EmbyTV.CancelTimerInternal");
+    Console.WriteLine($"[dvr-isolation] {cancelTimerApi.FullName}; {cancelInternal.FullName}");
+
+    return () =>
+    {
+        var code = EnsureDvrCode(module);
+        var ctx = EnsureDvrContext(module);
+        var al = AsyncLocalRefs(module, module.TypeSystem.String);
+
+        // En la API (cancelar timer / serie): DvrContext.Actor.Value = DvrCode.GetUserId(GetUserForRequest(null, false));
+        void SetActor(MethodDefinition handler)
+        {
+            var il = handler.Body.GetILProcessor();
+            var first = handler.Body.Instructions[0];
+            foreach (var ins in new[]
+            {
+                il.Create(OpCodes.Ldsfld, ctx.Actor),
+                il.Create(OpCodes.Ldarg_0),
+                il.Create(OpCodes.Ldnull),
+                il.Create(OpCodes.Ldc_I4_0),
+                il.Create(OpCodes.Call, getUserRef),
+                il.Create(OpCodes.Call, code["GetUserId"]),
+                il.Create(OpCodes.Callvirt, al.Set),
+            })
+                il.InsertBefore(first, ins);
+        }
+        SetActor(cancelTimerApi);
+        SetActor(cancelSeriesApi);
+
+        // En EmbyTV.CancelTimerInternal(series, timer, ...): DvrCode.AssertOwner(timer /*arg2*/, DvrContext.Actor.Value);
+        {
+            var il = cancelInternal.Body.GetILProcessor();
+            var first = cancelInternal.Body.Instructions[0];
+            foreach (var ins in new[]
+            {
+                il.Create(OpCodes.Ldarg_2),
+                il.Create(OpCodes.Ldsfld, ctx.Actor),
+                il.Create(OpCodes.Callvirt, al.Get),
+                il.Create(OpCodes.Call, code["AssertOwner"]),
             })
                 il.InsertBefore(first, ins);
         }
