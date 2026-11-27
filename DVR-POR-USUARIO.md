@@ -84,7 +84,26 @@ cancelar, la programación de otros.
   Esto es lo que impide que uno toque lo de otro, no solo que no lo vea.
 - Administrador: a decidir si ve y gestiona todo o también solo lo suyo.
 
-### 5. Grabación única con enlaces  (parche, el más delicado)
+### 5. Límite de grabaciones simultáneas por usuario  (parche)
+Cada usuario no puede tener más de N grabaciones a la vez (solapadas en el tiempo). Si programa
+una nueva que se solaparía con otras suyas y superaría su límite, se rechaza con error.
+- El número N NO es un campo nuevo: se reutiliza el límite de reproducciones/streams
+  simultáneos que ya tiene cada usuario en su configuración (UserPolicy; campo a confirmar:
+  SimultaneousStreamLimit / MaxActiveSessions). 1 pantalla → 1 grabación. Misma semántica que
+  Emby para el 0 (confirmar: 0 = ilimitado).
+- Es "a la vez", no total: puede programar las que quiera a lo largo del día; solo se cuentan
+  las que se solapan en horario con la nueva.
+- Cuenta contra TODO, sin distinguir DRM (Emby no sabe qué canal es DRM).
+- Punto: al crear timer en LiveTvService.Post(CreateTimer) (y CreateSeriesTimer). Se sacan los
+  timers del usuario (por OwnerUserId, pieza 1), se cuentan los que solapan [StartDate-padding,
+  EndDate+padding] con el nuevo, y si (solapados + 1) > límite, se rechaza (excepción -> la app
+  muestra el error).
+- Serie con límite 1 y dos episodios a la vez en canales distintos: el segundo episodio no se
+  graba (se salta), igual que un choque manual. (Confirmado por el usuario como comportamiento
+  por defecto.)
+- El administrador: a decidir si tiene límite o no (seguramente ilimitado).
+
+### 6. Grabación única con enlaces  (parche, el más delicado)
 Si dos usuarios programan el mismo evento (mismo canal + mismo horario), no abrir dos
 grabaciones: grabar una vez y, al terminar (o al crear el segundo timer), enlazar el archivo
 (hardlink) dentro de la carpeta del segundo usuario.
@@ -103,10 +122,27 @@ grabaciones: grabar una vez y, al terminar (o al crear el segundo timer), enlaza
 1. Localizar en el código real la DLL y las clases/métodos (sesión del servidor).
 2. Ajustar este plan a los nombres reales: dónde está el dueño, dónde se compone la ruta,
    dónde se listan los timers.
-3. Implementar en el parcheador, por partes: primero 1 y 2 (dueño + carpeta), luego 4
-   (programación privada), luego 3 por configuración, y 5 al final si interesa.
+3. Implementar en el parcheador, por fases (todo en Emby.LiveTV.Api.LiveTvService, que es la
+   única capa con ISessionContext; el motor EmbyTV/LiveTvManager no conoce el usuario):
+   - Fase A (bajo riesgo): dueño en el timer (pieza 1), filtrado y guardia de la programación
+     (pieza 4) y límite de simultáneas (pieza 5).
+   - Fase B: carpeta por usuario (pieza 2) y biblioteca automática con permisos (pieza 3).
+   - Fase C: grabación única con enlaces (pieza 6), si interesa.
 4. Probar en el entorno aislado (Emby 4.11.0.9) con dos usuarios de prueba.
 5. Aplicar en producción con copia de seguridad y verificar.
+
+## Dónde van los parches (código real 4.11.0.9)
+- Dueño, filtrado, guardia y límite: Emby.LiveTV.Api.LiveTvService (tiene ISessionContext;
+  User = sessionContext.GetUser(Request)). Manejadores: Post(CreateTimer), Post(CreateSeriesTimer),
+  Post(UpdateTimer), Post(UpdateSeriesTimer), Get(GetTimers), Get(GetSeriesTimers),
+  Any(CancelTimer), Any(CancelSeriesTimer).
+- Dueño guardado en TimerInfo.ProviderIds["OwnerUserId"] y SeriesTimerInfo.ProviderIds (ambos
+  tienen ProviderIds; no viaja a la app porque los DTO no llevan ProviderIds). En timers nacidos
+  de serie, copiar el dueño en EmbyTV.CreateTimerInfoForSeries.
+- Carpeta: apuntar TimerInfo.ParentFolderId a la biblioteca del usuario (opción A), sin tocar
+  GetRecordingPath.
+- Biblioteca automática: ILibraryManager.AddVirtualFolder + AddMediaPaths; permisos con
+  IUserManager.GetUserPolicy/UpdateUserPolicy (UserPolicy.EnableAllFolders=false, EnabledFolders).
 
 ## Dudas a confirmar con el usuario
 
