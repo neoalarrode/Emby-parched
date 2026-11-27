@@ -1,5 +1,6 @@
 using System;
 using System.Collections;
+using System.IO;
 using System.Reflection;
 
 namespace EmbyNoShare
@@ -35,11 +36,29 @@ namespace EmbyNoShare
                     if (!string.IsNullOrEmpty(s) && s != Guid.Empty.ToString() && s != "0")
                         return s;
                 }
+                Trace("GetUserId", user == null ? "user=null" : "sin nombre ni id");
+            }
+            catch (Exception e)
+            {
+                Trace("GetUserId", "excepcion: " + e.Message);
+            }
+            return null;
+        }
+
+        /// <summary>Traza de diagnóstico a un fichero, solo si está puesta la variable EMBY_DVR_DEBUG (su valor es la
+        /// ruta del fichero). Sin la variable no hace nada. Para localizar por dónde se pierde el dueño en pruebas.</summary>
+        public static void Trace(string tag, string msg)
+        {
+            try
+            {
+                string path = Environment.GetEnvironmentVariable("EMBY_DVR_DEBUG");
+                if (string.IsNullOrEmpty(path))
+                    return;
+                File.AppendAllText(path, DateTime.UtcNow.ToString("HH:mm:ss.fff") + " " + tag + ": " + (msg ?? "<null>") + "\n");
             }
             catch (Exception)
             {
             }
-            return null;
         }
 
         static IDictionary Providers(object timer)
@@ -53,11 +72,12 @@ namespace EmbyNoShare
         /// <summary>Marca el dueño del timer si aún no tiene (no pisa un dueño ya puesto).</summary>
         public static void SetOwnerId(object timer, string ownerId)
         {
+            IDictionary d = Providers(timer);
+            Trace("SetOwnerId", "owner=" + (ownerId ?? "null") + " providers=" + (d == null ? "null" : "ok"));
             if (ownerId == null)
                 return;
             try
             {
-                IDictionary d = Providers(timer);
                 if (d != null && !d.Contains("OwnerUserId"))
                     d["OwnerUserId"] = ownerId;
             }

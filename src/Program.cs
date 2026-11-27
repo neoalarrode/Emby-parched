@@ -2528,7 +2528,7 @@ static Action? PrepareDvrOwner(ModuleDefinition module)
                 il.Create(OpCodes.Ldsfld, ctx.Owner),
                 il.Create(OpCodes.Ldarg_0),
                 il.Create(OpCodes.Ldnull),
-                il.Create(OpCodes.Ldc_I4_0),
+                il.Create(OpCodes.Ldc_I4_1),  // autoRevertToLoggedInUser: true (con id nulo, usa el usuario de la sesion, tambien si es admin)
                 il.Create(OpCodes.Call, getUserRef),
                 il.Create(OpCodes.Call, code["GetUserId"]),
                 il.Create(OpCodes.Callvirt, al.Set),
@@ -2625,7 +2625,7 @@ static Action? PrepareDvrLimit(ModuleDefinition module)
                 il.Create(OpCodes.Ldsfld, ctx.Limit),
                 il.Create(OpCodes.Ldarg_0),
                 il.Create(OpCodes.Ldnull),
-                il.Create(OpCodes.Ldc_I4_0),
+                il.Create(OpCodes.Ldc_I4_1),  // autoRevertToLoggedInUser: true (con id nulo, usa el usuario de la sesion, tambien si es admin)
                 il.Create(OpCodes.Call, getUserRef),
                 il.Create(OpCodes.Call, code["SimultaneousLimit"]),
                 il.Create(OpCodes.Callvirt, alInt.Set),
@@ -2711,7 +2711,7 @@ static Action? PrepareDvrIsolation(ModuleDefinition module)
                 il.Create(OpCodes.Ldsfld, field),
                 il.Create(OpCodes.Ldarg_0),
                 il.Create(OpCodes.Ldnull),
-                il.Create(OpCodes.Ldc_I4_0),
+                il.Create(OpCodes.Ldc_I4_1),  // autoRevertToLoggedInUser: true (con id nulo, usa el usuario de la sesion, tambien si es admin)
                 il.Create(OpCodes.Call, getUserRef),
                 il.Create(OpCodes.Call, code["GetActorId"]),
                 il.Create(OpCodes.Callvirt, al.Set),
