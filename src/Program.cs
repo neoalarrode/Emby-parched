@@ -2514,6 +2514,9 @@ static Action? PrepareDvrOwner(ModuleDefinition module)
     // Refresco de guía: UpdateExistingTimerWithNewMetadata(existing, updated) copia updated.ProviderIds sobre
     // existing y borraría el dueño. Se conserva: se lee al entrar y se repone al salir.
     var updateExisting = EmbyTvMethod(module, m => m.Name == "UpdateExistingTimerWithNewMetadata" && m.IsStatic && m.Parameters.Count == 2 && m.Parameters[0].ParameterType.Name == "TimerInfo", "EmbyTV.UpdateExistingTimerWithNewMetadata");
+    // CopyProgramInfoToTimerInfo(program, timer) hace timer.ProviderIds = program.ProviderIds en VARIAS rutas (crear,
+    // disparar la grabación, serie). Se conserva el dueño del timer (arg2) igual: se lee al entrar y se repone al salir.
+    var copyProgram = EmbyTvMethod(module, m => m.Name == "CopyProgramInfoToTimerInfo" && !m.IsStatic && m.Parameters.Count == 2 && m.Parameters[1].ParameterType.Name == "TimerInfo", "EmbyTV.CopyProgramInfoToTimerInfo");
     Console.WriteLine($"[dvr-owner] {createTimerApi.FullName}; {createTimer.FullName}; {createForSeries.FullName}");
 
     return () =>
@@ -2582,36 +2585,39 @@ static Action? PrepareDvrOwner(ModuleDefinition module)
                 il.InsertBefore(first, ins);
         }
 
-        // En EmbyTV.UpdateExistingTimerWithNewMetadata(existing /*arg0*/, updated): conservar el dueño de 'existing'
-        // (se lee al entrar en una variable y se repone antes de cada ret, tras la copia que lo borra).
+        // Conservar el dueño del timer a través de métodos que le copian ProviderIds del programa (lo leen al entrar
+        // en una variable y lo reponen antes de cada ret). timerArg = índice ldarg del TimerInfo cuyo dueño conservar.
+        void PreserveOwner(MethodDefinition method, int timerArg)
         {
-            var il = updateExisting.Body.GetILProcessor();
+            var il = method.Body.GetILProcessor();
             var ownerLoc = new VariableDefinition(module.TypeSystem.String);
-            updateExisting.Body.Variables.Add(ownerLoc);
-            updateExisting.Body.InitLocals = true;
-            var first = updateExisting.Body.Instructions[0];
+            method.Body.Variables.Add(ownerLoc);
+            method.Body.InitLocals = true;
+            var first = method.Body.Instructions[0];
             foreach (var ins in new[]
             {
-                il.Create(OpCodes.Ldarg_0),
+                Ldarg(il, timerArg),
                 il.Create(OpCodes.Call, code["GetOwnerId"]),
                 il.Create(OpCodes.Stloc, ownerLoc),
             })
                 il.InsertBefore(first, ins);
-            foreach (var ret in updateExisting.Body.Instructions.Where(i => i.OpCode == OpCodes.Ret).ToList())
+            foreach (var ret in method.Body.Instructions.Where(i => i.OpCode == OpCodes.Ret).ToList())
             {
-                var restore = il.Create(OpCodes.Ldarg_0);
+                var restore = Ldarg(il, timerArg);
                 il.InsertBefore(ret, restore);
                 il.InsertBefore(ret, il.Create(OpCodes.Ldloc, ownerLoc));
                 il.InsertBefore(ret, il.Create(OpCodes.Call, code["SetOwnerFresh"]));
-                foreach (var i in updateExisting.Body.Instructions)
+                foreach (var i in method.Body.Instructions)
                     if (i.Operand == ret && i != restore) i.Operand = restore;
-                foreach (var eh in updateExisting.Body.ExceptionHandlers)
+                foreach (var eh in method.Body.ExceptionHandlers)
                 {
                     if (eh.HandlerEnd == ret) eh.HandlerEnd = restore;
                     if (eh.TryEnd == ret) eh.TryEnd = restore;
                 }
             }
         }
+        PreserveOwner(updateExisting, 0);   // static(existing, updated): existing = arg0
+        PreserveOwner(copyProgram, 2);      // instance(program, timer): timer = arg2
 
         // En EmbyTV.CreateTimerInfoForSeries(series, ...) -> TimerInfo: copiar el dueño de la serie al timer devuelto.
         {
