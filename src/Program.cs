@@ -2593,11 +2593,20 @@ static Action? PrepareDvrLimit(ModuleDefinition module)
         .Fields.SingleOrDefault(f => f.FieldType.Name == "TimerManager")
         ?? throw new Exception("No se encuentra EmbyTV._timerProvider (TimerManager)");
     var tmType = timerProvider.FieldType.Resolve() ?? throw new Exception("No se resuelve TimerManager");
-    // ItemDataProvider<TimerInfo>.GetAll() -> List<TimerInfo>
+    // GetAll() está en la base genérica ItemDataProvider`1<TimerInfo>. La llamada tiene que ir sobre la INSTANCIA
+    // CERRADA (ItemDataProvider<TimerInfo>), no sobre la definición abierta, o da «method not fully instantiated».
+    GenericInstanceType? baseInst = null;
     MethodDefinition? getAllDef = null;
-    for (var t = tmType; t != null && getAllDef == null; t = t.BaseType?.Resolve())
-        getAllDef = t.Methods.FirstOrDefault(m => m.Name == "GetAll" && m.Parameters.Count == 0 && !m.IsStatic);
-    if (getAllDef == null) throw new Exception("No se encuentra TimerManager.GetAll()");
+    for (var bt = tmType.BaseType; bt != null && getAllDef == null; bt = bt.Resolve()?.BaseType)
+    {
+        if (bt is GenericInstanceType git)
+        {
+            var def = git.ElementType.Resolve();
+            var m = def?.Methods.FirstOrDefault(x => x.Name == "GetAll" && x.Parameters.Count == 0 && !x.IsStatic);
+            if (m != null) { baseInst = git; getAllDef = m; }
+        }
+    }
+    if (getAllDef == null || baseInst == null) throw new Exception("No se encuentra ItemDataProvider<TimerInfo>.GetAll()");
     Console.WriteLine($"[dvr-limit] {createTimerApi.FullName}; {createTimer.FullName}");
 
     return () =>
@@ -2633,7 +2642,13 @@ static Action? PrepareDvrLimit(ModuleDefinition module)
         {
             var il = createTimer.Body.GetILProcessor();
             var first = createTimer.Body.Instructions[0];
-            var getAll = module.ImportReference(getAllDef);
+            // MemberRef de GetAll con padre = TypeSpec ItemDataProvider<TimerInfo> (instancia cerrada)
+            var getAll = module.ImportReference(new MethodReference(getAllDef.Name, getAllDef.ReturnType, baseInst)
+            {
+                HasThis = getAllDef.HasThis,
+                ExplicitThis = getAllDef.ExplicitThis,
+                CallingConvention = getAllDef.CallingConvention,
+            });
             foreach (var ins in new[]
             {
                 il.Create(OpCodes.Ldarg_0),
