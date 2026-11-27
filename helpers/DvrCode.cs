@@ -123,6 +123,92 @@ namespace EmbyNoShare
             }
         }
 
+        static DateTimeOffset ReadDate(object o, string prop)
+        {
+            try
+            {
+                PropertyInfo p = o.GetType().GetProperty(prop);
+                object v = p != null ? p.GetValue(o) : null;
+                return v is DateTimeOffset ? (DateTimeOffset)v : DateTimeOffset.MinValue;
+            }
+            catch (Exception)
+            {
+                return DateTimeOffset.MinValue;
+            }
+        }
+
+        static int ReadInt(object o, string prop)
+        {
+            try
+            {
+                PropertyInfo p = o.GetType().GetProperty(prop);
+                object v = p != null ? p.GetValue(o) : null;
+                return v is int ? (int)v : 0;
+            }
+            catch (Exception)
+            {
+                return 0;
+            }
+        }
+
+        static string ReadStr(object o, string prop)
+        {
+            try
+            {
+                PropertyInfo p = o.GetType().GetProperty(prop);
+                object v = p != null ? p.GetValue(o) : null;
+                return v != null ? v.ToString() : null;
+            }
+            catch (Exception)
+            {
+                return null;
+            }
+        }
+
+        /// <summary>Ventana del timer con sus márgenes: [inicio - prePadding, fin + postPadding].</summary>
+        static bool Window(object timer, out DateTimeOffset start, out DateTimeOffset end)
+        {
+            start = ReadDate(timer, "StartDate");
+            end = ReadDate(timer, "EndDate");
+            if (start == DateTimeOffset.MinValue || end == DateTimeOffset.MinValue || end <= start)
+                return false;
+            start = start.AddSeconds(-ReadInt(timer, "PrePaddingSeconds"));
+            end = end.AddSeconds(ReadInt(timer, "PostPaddingSeconds"));
+            return true;
+        }
+
+        /// <summary>Límite de grabaciones a la vez: si el dueño del timer nuevo ya tiene 'limit' grabaciones que
+        /// solapan en el tiempo con esta, lanza una excepción (la app muestra el error y no se programa). 'existing'
+        /// son todos los timers actuales. limit 0 o negativo = sin límite.</summary>
+        public static void CheckLimit(IEnumerable existing, object newTimer, string owner, int limit)
+        {
+            if (limit <= 0 || newTimer == null || existing == null || owner == null)
+                return;
+            DateTimeOffset ns, ne;
+            if (!Window(newTimer, out ns, out ne))
+                return;
+            string newId = ReadStr(newTimer, "Id");
+            int count = 0;
+            foreach (object t in existing)
+            {
+                if (t == null)
+                    continue;
+                string id = ReadStr(t, "Id");
+                if (newId != null && string.Equals(id, newId, StringComparison.Ordinal))
+                    continue;                                   // el propio timer, si ya estuviera en la lista
+                if (!string.Equals(GetOwnerId(t), owner, StringComparison.Ordinal))
+                    continue;                                   // de otro usuario
+                DateTimeOffset s, e;
+                if (!Window(t, out s, out e))
+                    continue;
+                if (ns < e && s < ne)                            // se solapan
+                    count++;
+            }
+            if (count + 1 > limit)
+                throw new InvalidOperationException(
+                    "Has alcanzado tu limite de " + limit + " grabacion(es) a la vez. Cancela otra o espera a que termine para programar esta.");
+        }
+
         public static bool IsAdmin(object user)
         {
             try
