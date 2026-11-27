@@ -55,6 +55,21 @@ del usuario dueño:  `.../Grabaciones/<usuario>/<programa>/...`.
 - Sin dueño (grabaciones viejas o del propio servidor): va a una carpeta común
   `.../Grabaciones/_comunes/`, para no perder nada.
 
+### Estado fase B (carpetas/bibliotecas): BORRADOR, a validar en el Emby de pruebas
+Helper `DvrLibraryCode` (helpers/DvrLibraryCode.cs), aún NO activado como parche:
+- `SafeName`, `EnsureUserFolder` (crea `<raíz>/<usuario>`), `UserRecordingPath` (inserta la subcarpeta del usuario
+  en la ruta ya formada) — listos.
+- Creación de biblioteca (ILibraryManager.AddVirtualFolder(name, collectionType, LibraryOptions, refresh) +
+  AddMediaPaths(CollectionFolder, MediaPathInfo[]{Path}, refresh)) y permisos — a completar en vivo.
+Punto DELICADO (permisos): cada usuario debe ver SOLO sus grabaciones PERO conservar sus bibliotecas normales
+(pelis/series del NAS). O sea, no vale «darle una sola carpeta»: UserPolicy.EnableAllFolders=false y EnabledFolders =
+bibliotecas normales + la suya de grabaciones; y la biblioteca de grabaciones de cada uno NO entra en EnabledFolders
+de los demás. Hacerlo mal deja a un usuario sin acceso a nada, por eso se afina contra el Emby de pruebas.
+Ruta real: lo más limpio sería apuntar el timer a la biblioteca del usuario (ParentFolderId) para que Emby grabe ahí
+de forma nativa en todas las ramas (TV/película/serie); si no, usar UserRecordingPath sobre el retorno de
+EmbyTV.GetRecordingPath / GetDefaultRecordingPathForSeries. A decidir con el Emby de pruebas.
+Identidad del dueño = nombre de usuario (ya aplicado), así la carpeta es `Grabaciones/<nombre>`.
+
 ### 3. Una biblioteca por usuario, automática  (parche)
 Requisito del usuario: NADA a mano. Solo se configura UNA carpeta raíz de grabaciones en el
 DVR de Emby. Lo demás, solo:
