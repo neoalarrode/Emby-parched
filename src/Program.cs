@@ -2424,35 +2424,37 @@ static (TypeReference Inst, MethodReference Ctor, MethodReference Get, MethodRef
 //       public static AsyncLocal<int>    Limit = new();   // su límite de grabaciones a la vez (0 = sin límite)
 //   }
 // Idempotente: lo crea una vez y lo reutilizan dvr-owner y dvr-limit, en cualquier orden.
-static (TypeDefinition Holder, FieldReference Owner, FieldReference Limit, FieldReference Actor) EnsureDvrContext(ModuleDefinition module)
+static (TypeDefinition Holder, FieldReference Owner, FieldReference Limit, FieldReference Actor, FieldReference Viewer) EnsureDvrContext(ModuleDefinition module)
 {
     var ts = module.TypeSystem;
     var holder = module.GetType("EmbyNoShare.DvrContext");
     if (holder != null)
-        return (holder, holder.Fields.Single(f => f.Name == "Owner"), holder.Fields.Single(f => f.Name == "Limit"), holder.Fields.Single(f => f.Name == "Actor"));
+        return (holder, holder.Fields.Single(f => f.Name == "Owner"), holder.Fields.Single(f => f.Name == "Limit"),
+                holder.Fields.Single(f => f.Name == "Actor"), holder.Fields.Single(f => f.Name == "Viewer"));
     var alStr = AsyncLocalRefs(module, ts.String);
     var alInt = AsyncLocalRefs(module, ts.Int32);
     holder = new TypeDefinition("EmbyNoShare", "DvrContext",
         TypeAttributes.NotPublic | TypeAttributes.Abstract | TypeAttributes.Sealed | TypeAttributes.BeforeFieldInit, ts.Object);
     module.Types.Add(holder);
-    var owner = new FieldDefinition("Owner", FieldAttributes.Public | FieldAttributes.Static, alStr.Inst);  // dueño del timer que se crea
-    var limit = new FieldDefinition("Limit", FieldAttributes.Public | FieldAttributes.Static, alInt.Inst);  // su límite de simultáneas
-    var actor = new FieldDefinition("Actor", FieldAttributes.Public | FieldAttributes.Static, alStr.Inst);  // usuario que pide cancelar/editar
+    var owner = new FieldDefinition("Owner", FieldAttributes.Public | FieldAttributes.Static, alStr.Inst);   // dueño del timer que se crea
+    var limit = new FieldDefinition("Limit", FieldAttributes.Public | FieldAttributes.Static, alInt.Inst);   // su límite de simultáneas
+    var actor = new FieldDefinition("Actor", FieldAttributes.Public | FieldAttributes.Static, alStr.Inst);   // usuario que pide cancelar/editar (null = admin)
+    var viewer = new FieldDefinition("Viewer", FieldAttributes.Public | FieldAttributes.Static, alStr.Inst); // usuario que pide la lista (null = admin: ve todo)
     holder.Fields.Add(owner);
     holder.Fields.Add(limit);
     holder.Fields.Add(actor);
+    holder.Fields.Add(viewer);
     var cctor = new MethodDefinition(".cctor",
         MethodAttributes.Private | MethodAttributes.Static | MethodAttributes.HideBySig | MethodAttributes.SpecialName | MethodAttributes.RTSpecialName, ts.Void);
     var ci = cctor.Body.GetILProcessor();
-    ci.Append(ci.Create(OpCodes.Newobj, alStr.Ctor));
-    ci.Append(ci.Create(OpCodes.Stsfld, owner));
-    ci.Append(ci.Create(OpCodes.Newobj, alInt.Ctor));
-    ci.Append(ci.Create(OpCodes.Stsfld, limit));
-    ci.Append(ci.Create(OpCodes.Newobj, alStr.Ctor));
-    ci.Append(ci.Create(OpCodes.Stsfld, actor));
+    foreach (var f in new[] { owner, limit, actor, viewer })
+    {
+        ci.Append(ci.Create(OpCodes.Newobj, f == limit ? alInt.Ctor : alStr.Ctor));
+        ci.Append(ci.Create(OpCodes.Stsfld, f));
+    }
     ci.Append(ci.Create(OpCodes.Ret));
     holder.Methods.Add(cctor);
-    return (holder, owner, limit, actor);
+    return (holder, owner, limit, actor, viewer);
 }
 
 // Copia del helper DvrCode (una sola vez): si ya está, devuelve sus métodos; si no, lo copia con CopyHelpers.
@@ -2644,9 +2646,25 @@ static Action? PrepareDvrIsolation(ModuleDefinition module)
     var service = module.GetType("Emby.LiveTV.Api.LiveTvService") ?? throw new Exception("No se encuentra LiveTvService");
     var cancelTimerApi = DvrHandler(service, "CancelTimer");
     var cancelSeriesApi = DvrHandler(service, "CancelSeriesTimer");
+    var getTimersApi = DvrHandler(service, "GetTimers");
+    var getSeriesApi = DvrHandler(service, "GetSeriesTimers");
+    var updateTimerApi = DvrHandler(service, "UpdateTimer");
+    var updateSeriesApi = DvrHandler(service, "UpdateSeriesTimer");
     var getUserRef = GetUserForRequestRef(module, service);
     var cancelInternal = EmbyTvMethod(module, m => m.Name == "CancelTimerInternal" && !m.IsStatic && m.Parameters.Count >= 2 && m.Parameters[1].ParameterType.Name == "TimerInfo", "EmbyTV.CancelTimerInternal");
-    Console.WriteLine($"[dvr-isolation] {cancelTimerApi.FullName}; {cancelInternal.FullName}");
+    var updateAsync = EmbyTvMethod(module, m => m.Name == "UpdateTimerAsync" && !m.IsStatic && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.Name == "TimerInfo", "EmbyTV.UpdateTimerAsync(TimerInfo)");
+    var embyTvType = module.GetType("Emby.LiveTV.EmbyTV") ?? module.GetTypes().First(t => t.Name == "EmbyTV");
+    var timerProviderField = embyTvType.Fields.SingleOrDefault(f => f.FieldType.Name == "TimerManager") ?? throw new Exception("No se encuentra EmbyTV._timerProvider");
+    var getTimerById = timerProviderField.FieldType.Resolve().Methods.SingleOrDefault(m => m.Name == "GetTimer" && m.Parameters.Count == 1 && m.Parameters[0].ParameterType.FullName == "System.String")
+        ?? throw new Exception("No se encuentra TimerManager.GetTimer(string)");
+    var timerIdGetter = updateAsync.Parameters[0].ParameterType.Resolve().Properties.SingleOrDefault(p => p.Name == "Id")?.GetMethod
+        ?? throw new Exception("No se encuentra TimerInfo.Id");
+    var manager = module.GetType("Emby.LiveTV.LiveTvManager") ?? throw new Exception("No se encuentra LiveTvManager");
+    MethodDefinition Internal(string name) => manager.Methods.SingleOrDefault(m => m.Name == name && m.Parameters.Count == 1 && m.ReturnType.Name == "QueryResult`1")
+        ?? throw new Exception("No se encuentra LiveTvManager." + name);
+    var getTimersInternal = Internal("GetTimersInternal");
+    var getSeriesInternal = Internal("GetSeriesTimersInternal");
+    Console.WriteLine($"[dvr-isolation] {cancelInternal.FullName}; {getTimersInternal.FullName}; {getSeriesInternal.FullName}");
 
     return () =>
     {
@@ -2654,25 +2672,29 @@ static Action? PrepareDvrIsolation(ModuleDefinition module)
         var ctx = EnsureDvrContext(module);
         var al = AsyncLocalRefs(module, module.TypeSystem.String);
 
-        // En la API (cancelar timer / serie): DvrContext.Actor.Value = DvrCode.GetUserId(GetUserForRequest(null, false));
-        void SetActor(MethodDefinition handler)
+        // En la API: DvrContext.<campo>.Value = DvrCode.GetActorId(GetUserForRequest(null, false));  (null si es admin)
+        void SetContext(MethodDefinition handler, FieldReference field)
         {
             var il = handler.Body.GetILProcessor();
             var first = handler.Body.Instructions[0];
             foreach (var ins in new[]
             {
-                il.Create(OpCodes.Ldsfld, ctx.Actor),
+                il.Create(OpCodes.Ldsfld, field),
                 il.Create(OpCodes.Ldarg_0),
                 il.Create(OpCodes.Ldnull),
                 il.Create(OpCodes.Ldc_I4_0),
                 il.Create(OpCodes.Call, getUserRef),
-                il.Create(OpCodes.Call, code["GetUserId"]),
+                il.Create(OpCodes.Call, code["GetActorId"]),
                 il.Create(OpCodes.Callvirt, al.Set),
             })
                 il.InsertBefore(first, ins);
         }
-        SetActor(cancelTimerApi);
-        SetActor(cancelSeriesApi);
+        SetContext(cancelTimerApi, ctx.Actor);
+        SetContext(cancelSeriesApi, ctx.Actor);
+        SetContext(updateTimerApi, ctx.Actor);
+        SetContext(updateSeriesApi, ctx.Actor);
+        SetContext(getTimersApi, ctx.Viewer);
+        SetContext(getSeriesApi, ctx.Viewer);
 
         // En EmbyTV.CancelTimerInternal(series, timer, ...): DvrCode.AssertOwner(timer /*arg2*/, DvrContext.Actor.Value);
         {
@@ -2684,6 +2706,52 @@ static Action? PrepareDvrIsolation(ModuleDefinition module)
                 il.Create(OpCodes.Ldsfld, ctx.Actor),
                 il.Create(OpCodes.Callvirt, al.Get),
                 il.Create(OpCodes.Call, code["AssertOwner"]),
+            })
+                il.InsertBefore(first, ins);
+        }
+
+        // En LiveTvManager.GetTimersInternal / GetSeriesTimersInternal: result = DvrCode.FilterTimers(result, DvrContext.Viewer.Value);
+        // Solo filtra cuando Viewer está puesto (petición de lista de una persona no-admin); las llamadas internas no lo ponen.
+        void FilterReturn(MethodDefinition method)
+        {
+            var il = method.Body.GetILProcessor();
+            foreach (var ret in method.Body.Instructions.Where(i => i.OpCode == OpCodes.Ret).ToList())
+            {
+                var viewer = il.Create(OpCodes.Ldsfld, ctx.Viewer);
+                il.InsertBefore(ret, viewer);
+                il.InsertBefore(ret, il.Create(OpCodes.Callvirt, al.Get));
+                il.InsertBefore(ret, il.Create(OpCodes.Call, code["FilterTimers"]));
+                il.InsertBefore(ret, il.Create(OpCodes.Castclass, method.ReturnType));   // FilterTimers devuelve object; vuelve al tipo del método
+                foreach (var i in method.Body.Instructions)
+                    if (i.Operand == ret && i != viewer) i.Operand = viewer;
+                foreach (var eh in method.Body.ExceptionHandlers)
+                {
+                    if (eh.HandlerEnd == ret) eh.HandlerEnd = viewer;
+                    if (eh.TryEnd == ret) eh.TryEnd = viewer;
+                }
+            }
+        }
+        FilterReturn(getTimersInternal);
+        FilterReturn(getSeriesInternal);
+
+        // En EmbyTV.UpdateTimerAsync(TimerInfo timer): comprobar dueño y conservarlo (el DTO no lo trae):
+        //   DvrCode.UpdateGuard(this._timerProvider.GetTimer(timer.Id), timer, DvrContext.Actor.Value);
+        {
+            var il = updateAsync.Body.GetILProcessor();
+            var first = updateAsync.Body.Instructions[0];
+            var getTimerRef = module.ImportReference(getTimerById);
+            var idRef = module.ImportReference(timerIdGetter);
+            foreach (var ins in new[]
+            {
+                il.Create(OpCodes.Ldarg_0),
+                il.Create(OpCodes.Ldfld, timerProviderField),
+                il.Create(OpCodes.Ldarg_1),
+                il.Create(OpCodes.Callvirt, idRef),
+                il.Create(OpCodes.Callvirt, getTimerRef),
+                il.Create(OpCodes.Ldarg_1),
+                il.Create(OpCodes.Ldsfld, ctx.Actor),
+                il.Create(OpCodes.Callvirt, al.Get),
+                il.Create(OpCodes.Call, code["UpdateGuard"]),
             })
                 il.InsertBefore(first, ins);
         }

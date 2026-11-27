@@ -108,6 +108,29 @@ namespace EmbyNoShare
                 throw new InvalidOperationException("Esta grabacion es de otro usuario.");
         }
 
+        /// <summary>Al editar un timer: comprueba que 'actor' es el dueño del timer existente (si no, lanza), y
+        /// conserva el dueño en el timer actualizado (el DTO que llega de la app no trae el dueño y se perdería al
+        /// reconstruir el timer). 'existing' puede ser null (timer no encontrado): no hace nada.</summary>
+        public static void UpdateGuard(object existing, object updated, string actor)
+        {
+            if (existing == null)
+                return;
+            AssertOwner(existing, actor);
+            string owner = GetOwnerId(existing);
+            if (owner != null)
+            {
+                try
+                {
+                    IDictionary d = Providers(updated);
+                    if (d != null)
+                        d["OwnerUserId"] = owner;
+                }
+                catch (Exception)
+                {
+                }
+            }
+        }
+
         static object Policy(object user)
         {
             if (user == null)
@@ -235,6 +258,56 @@ namespace EmbyNoShare
             {
                 return false;
             }
+        }
+
+        /// <summary>Id del usuario que actúa, para ver/cancelar/editar; null si es administrador (null = ver y poder
+        /// con todo, sin filtro ni candado). Así el admin gestiona el DVR de todos.</summary>
+        public static string GetActorId(object user)
+        {
+            return IsAdmin(user) ? null : GetUserId(user);
+        }
+
+        /// <summary>Filtra un QueryResult de timers para dejar solo los del actor (y los sin dueño, grabaciones
+        /// antiguas). Si actor es null (administrador o acción interna), no cambia nada. Devuelve el mismo objeto.</summary>
+        public static object FilterTimers(object queryResult, string actor)
+        {
+            if (queryResult == null || actor == null)
+                return queryResult;
+            try
+            {
+                PropertyInfo itemsProp = queryResult.GetType().GetProperty("Items");
+                Array items = itemsProp != null ? itemsProp.GetValue(queryResult) as Array : null;
+                if (items == null)
+                    return queryResult;
+                Type element = items.GetType().GetElementType();
+                int kept = 0;
+                for (int i = 0; i < items.Length; i++)
+                {
+                    object t = items.GetValue(i);
+                    string owner = GetOwnerId(t);
+                    if (owner == null || string.Equals(owner, actor, StringComparison.Ordinal))
+                        kept++;
+                }
+                if (kept == items.Length)
+                    return queryResult;
+                Array dst = Array.CreateInstance(element, kept);
+                int j = 0;
+                for (int i = 0; i < items.Length; i++)
+                {
+                    object t = items.GetValue(i);
+                    string owner = GetOwnerId(t);
+                    if (owner == null || string.Equals(owner, actor, StringComparison.Ordinal))
+                        dst.SetValue(t, j++);
+                }
+                itemsProp.SetValue(queryResult, dst);
+                PropertyInfo countProp = queryResult.GetType().GetProperty("TotalRecordCount");
+                if (countProp != null && countProp.CanWrite)
+                    countProp.SetValue(queryResult, kept);
+            }
+            catch (Exception)
+            {
+            }
+            return queryResult;
         }
     }
 }
