@@ -2403,11 +2403,25 @@ static VariableDefinition? LoadedLocal(MethodDefinition method, Instruction ins)
 // operación asíncrona) y EmbyTV.CreateTimer lo estampa en TimerInfo.ProviderIds["OwnerUserId"] al guardar. En los
 // timers que nacen de una serie, el dueño se copia de la serie. ProviderIds se serializa con el timer, así que el
 // dueño sobrevive a los reinicios sin tocar el esquema del DVR.
+// Ensamblado donde referenciar AsyncLocal`1. El System.Runtime recortado que trae Emby NO tiene ese tipo ni lo
+// reenvía (daría TypeLoadException en ejecución), así que se referencia contra System.Private.CoreLib, donde está el
+// tipo de verdad (System.Threading.dll solo lo reenvía allí). Se reutiliza la referencia si ya existe, o se añade.
+static IMetadataScope CoreLibForAsyncLocal(ModuleDefinition module)
+{
+    var core = module.AssemblyReferences.FirstOrDefault(a => a.Name == "System.Private.CoreLib");
+    if (core != null) return core;
+    var threading = module.AssemblyReferences.FirstOrDefault(a => a.Name == "System.Threading");
+    var model = module.AssemblyReferences.FirstOrDefault(a => a.Name == "System.Runtime") ?? threading ?? module.AssemblyReferences[0];
+    var added = new AssemblyNameReference("System.Private.CoreLib", new Version(8, 0, 0, 0)) { PublicKeyToken = model.PublicKeyToken };
+    module.AssemblyReferences.Add(added);
+    return added;
+}
+
 // Referencias a AsyncLocal<T> (T = string o int): el tipo instanciado y sus .ctor / get_Value / set_Value, ya importados.
 static (TypeReference Inst, MethodReference Ctor, MethodReference Get, MethodReference Set) AsyncLocalRefs(ModuleDefinition module, TypeReference element)
 {
     var ts = module.TypeSystem;
-    var open = new TypeReference("System.Threading", "AsyncLocal`1", module, ts.CoreLibrary, valueType: false);
+    var open = new TypeReference("System.Threading", "AsyncLocal`1", module, CoreLibForAsyncLocal(module), valueType: false);
     open.GenericParameters.Add(new GenericParameter(open));
     var inst = new GenericInstanceType(open);
     inst.GenericArguments.Add(element);
