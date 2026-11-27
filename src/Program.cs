@@ -2745,11 +2745,14 @@ static Action? PrepareDvrIsolation(ModuleDefinition module)
     var timerIdGetter = updateAsync.Parameters[0].ParameterType.Resolve().Properties.SingleOrDefault(p => p.Name == "Id")?.GetMethod
         ?? throw new Exception("No se encuentra TimerInfo.Id");
     var manager = module.GetType("Emby.LiveTV.LiveTvManager") ?? throw new Exception("No se encuentra LiveTvManager");
-    MethodDefinition Internal(string name) => manager.Methods.SingleOrDefault(m => m.Name == name && m.Parameters.Count == 1 && m.ReturnType.Name == "QueryResult`1")
-        ?? throw new Exception("No se encuentra LiveTvManager." + name);
-    var getTimersInternal = Internal("GetTimersInternal");
-    var getSeriesInternal = Internal("GetSeriesTimersInternal");
-    Console.WriteLine($"[dvr-isolation] {cancelInternal.FullName}; {getTimersInternal.FullName}; {getSeriesInternal.FullName}");
+    // Los que usa la API y construyen los DTO a partir de _embyTvProvider.GetTimers().ToList(): GetTimers(TimerQuery,
+    // CancellationToken) y GetSeriesTimers(SeriesTimerQuery, CancellationToken). Ahí se filtra la lista por el viewer.
+    MethodDefinition DtoList(string name, string queryType) => manager.Methods.SingleOrDefault(m => m.Name == name && m.Parameters.Count == 2
+        && m.Parameters[0].ParameterType.Name == queryType && m.Parameters[1].ParameterType.Name == "CancellationToken" && m.ReturnType.Name == "QueryResult`1")
+        ?? throw new Exception("No se encuentra LiveTvManager." + name + "(" + queryType + ", CancellationToken)");
+    var getTimersDto = DtoList("GetTimers", "TimerQuery");
+    var getSeriesDto = DtoList("GetSeriesTimers", "SeriesTimerQuery");
+    Console.WriteLine($"[dvr-isolation] {cancelInternal.FullName}; {getTimersDto.FullName}; {getSeriesDto.FullName}");
 
     return () =>
     {
@@ -2795,29 +2798,32 @@ static Action? PrepareDvrIsolation(ModuleDefinition module)
                 il.InsertBefore(first, ins);
         }
 
-        // En LiveTvManager.GetTimersInternal / GetSeriesTimersInternal: result = DvrCode.FilterTimers(result, DvrContext.Viewer.Value);
-        // Solo filtra cuando Viewer está puesto (petición de lista de una persona no-admin); las llamadas internas no lo ponen.
-        void FilterReturn(MethodDefinition method)
+        // En LiveTvManager.GetTimers/GetSeriesTimers(query, ct): justo tras «enumerable = _embyTvProvider.GetTimers().ToList()»
+        // se filtra esa lista por el viewer: DvrCode.RemoveNotOwned(enumerable, DvrContext.Viewer.Value). La lista lleva los
+        // timers internos con su dueño; los DTO que se construyen después ya salen filtrados. Viewer null (admin) = no filtra.
+        void FilterList(MethodDefinition method)
         {
+            var toList = method.Body.Instructions.FirstOrDefault(i => (i.OpCode == OpCodes.Call || i.OpCode == OpCodes.Callvirt)
+                && i.Operand is MethodReference m && m.Name == "ToList" && m.DeclaringType.FullName == "System.Linq.Enumerable")
+                ?? throw new Exception($"No se encuentra la primera ToList() en {method.Name}");
+            var store = toList.Next;
+            var local = StoredLocal(method, store) ?? throw new Exception($"Patrón inesperado tras ToList() en {method.Name}: {store}");
             var il = method.Body.GetILProcessor();
-            foreach (var ret in method.Body.Instructions.Where(i => i.OpCode == OpCodes.Ret).ToList())
+            var at = store;
+            foreach (var ins in new[]
             {
-                var viewer = il.Create(OpCodes.Ldsfld, ctx.Viewer);
-                il.InsertBefore(ret, viewer);
-                il.InsertBefore(ret, il.Create(OpCodes.Callvirt, al.Get));
-                il.InsertBefore(ret, il.Create(OpCodes.Call, code["FilterTimers"]));
-                il.InsertBefore(ret, il.Create(OpCodes.Castclass, method.ReturnType));   // FilterTimers devuelve object; vuelve al tipo del método
-                foreach (var i in method.Body.Instructions)
-                    if (i.Operand == ret && i != viewer) i.Operand = viewer;
-                foreach (var eh in method.Body.ExceptionHandlers)
-                {
-                    if (eh.HandlerEnd == ret) eh.HandlerEnd = viewer;
-                    if (eh.TryEnd == ret) eh.TryEnd = viewer;
-                }
+                il.Create(OpCodes.Ldloc, local),
+                il.Create(OpCodes.Ldsfld, ctx.Viewer),
+                il.Create(OpCodes.Callvirt, al.Get),
+                il.Create(OpCodes.Call, code["RemoveNotOwned"]),
+            })
+            {
+                il.InsertAfter(at, ins);
+                at = ins;
             }
         }
-        FilterReturn(getTimersInternal);
-        FilterReturn(getSeriesInternal);
+        FilterList(getTimersDto);
+        FilterList(getSeriesDto);
 
         // En EmbyTV.UpdateTimerAsync(TimerInfo timer): comprobar dueño y conservarlo (el DTO no lo trae):
         //   DvrCode.UpdateGuard(this._timerProvider.GetTimer(timer.Id), timer, DvrContext.Actor.Value);

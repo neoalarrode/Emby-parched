@@ -317,6 +317,26 @@ namespace EmbyNoShare
             return IsAdmin(user) ? null : GetUserId(user);
         }
 
+        /// <summary>Quita de una lista (IList de timers) los que NO son del viewer (deja los suyos y los sin dueño).
+        /// Si viewer es null (admin o acción interna) no toca nada. Modifica la lista en el sitio.</summary>
+        public static void RemoveNotOwned(object list, string viewer)
+        {
+            if (viewer == null || !(list is IList l))
+                return;
+            try
+            {
+                for (int i = l.Count - 1; i >= 0; i--)
+                {
+                    string owner = GetOwnerId(l[i]);
+                    if (owner != null && !string.Equals(owner, viewer, StringComparison.Ordinal))
+                        l.RemoveAt(i);
+                }
+            }
+            catch (Exception)
+            {
+            }
+        }
+
         /// <summary>Filtra un QueryResult de timers para dejar solo los del actor (y los sin dueño, grabaciones
         /// antiguas). Si actor es null (administrador o acción interna), no cambia nada. Devuelve el mismo objeto.</summary>
         public static object FilterTimers(object queryResult, string actor)
